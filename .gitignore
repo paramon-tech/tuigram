@@ -27,6 +27,15 @@ go.work.sum
 # env file
 .env
 
+# Local builds and Telegram data (never commit credentials or sessions)
+/bin/
+/dist/
+*.enc
+*.session
+*.cache
+/config.json
+/tuigram
+
 # Editor/IDE
 # .idea/
 # .vscode/

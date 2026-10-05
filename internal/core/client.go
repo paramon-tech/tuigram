@@ -7,28 +7,34 @@ import (
 )
 
 type Chat struct {
-	ID     string
-	Title  string
-	Kind   string // private, group, or channel
-	Unread int
+	ID                           string
+	Title                        string
+	Kind                         string // private, group, or channel
+	Unread                       int
+	Pinned, Archived, Muted      bool
+	Contact, Bot, UnreadMark     bool
+	TopMessageID, ReadInboxMaxID int
 }
 
 type Reaction struct {
 	Emoji string
 	Count int
+	Mine  bool
 }
 
 type Message struct {
-	ID         int
-	ChatID     string
-	Sender     string
-	Text       string
-	Time       time.Time
-	Outgoing   bool
-	Forwarded  bool
-	Reactions  []Reaction
-	Image      bool
-	MediaLabel string
+	ID           int
+	ChatID       string
+	Sender       string
+	Text         string
+	Time         time.Time
+	Outgoing     bool
+	Forwarded    bool
+	Reactions    []Reaction
+	Image        bool
+	Downloadable bool
+	Voice        bool
+	MediaLabel   string
 	// MediaKey identifies cacheable media within an authenticated account and
 	// revision. An empty key forbids disk caching (unknown or protected media).
 	MediaKey string

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/paramon-tech/tuigram/internal/config"
 	"github.com/paramon-tech/tuigram/internal/core"
 )
 
@@ -18,9 +19,14 @@ type Cache interface {
 }
 
 type Options struct {
-	Theme        string
-	PollInterval time.Duration
-	Cache        Cache
+	Theme           string
+	PollInterval    time.Duration
+	Cache           Cache
+	DownloadDir     string
+	PlayAudio       func(context.Context, string) error
+	Preferences     config.Preferences
+	SavePreferences func(config.Preferences) error
+	DisableAutoRead bool
 }
 
 type mode int
@@ -35,9 +41,19 @@ const (
 	imagePreview
 	messageReader
 	help
+	manageForm
+	confirmAction
+	callPanel
+	settingsPanel
+	organizationPanel
+	reactionPicker
 )
 
 type tickMsg time.Time
+type pollTickMsg struct {
+	generation uint64
+	time       time.Time
+}
 type dialogsMsg struct {
 	request uint64
 	chats   []core.Chat
@@ -85,6 +101,32 @@ type Model struct {
 	dialogsRequest, historyRequest, contactsRequest, imageRequest uint64
 	forwardSource                                                 core.Chat
 	forwardMessage                                                int
+	form                                                          actionForm
+	confirmation                                                  pendingAction
+	selectingGroup                                                bool
+	groupMembers                                                  map[string]core.Contact
+	mediaRequest                                                  uint64
+	mediaCancel                                                   context.CancelFunc
+	mediaTasks                                                    []mediaTask
+	mediaStatus                                                   string
+	call                                                          core.CallState
+	callTarget                                                    core.Chat
+	callRequest                                                   uint64
+	callPending                                                   bool
+	callCancel                                                    context.CancelFunc
+	callPendingAction                                             string
+	callReturnMode                                                mode
+	uploadCancel                                                  context.CancelFunc
+	settings                                                      settingsState
+	allChats                                                      []core.Chat
+	organization                                                  organizationState
+	attachmentAsFile                                              bool
+	reaction                                                      reactionPickerState
+	history                                                       historyState
+	historyObscured                                               bool
+	pollGeneration                                                uint64
+	backgroundDialogs                                             uint64
+	pollRetryAt                                                   time.Time
 }
 
 func New(ctx context.Context, client core.Client, opts Options) Model {
@@ -101,13 +143,15 @@ func New(ctx context.Context, client core.Client, opts Options) Model {
 		status: "Connecting…", dialogsRequest: 1, dialogsPending: true, drafts: make(map[string]string)}
 }
 
-func (m Model) Init() tea.Cmd { return tea.Batch(m.dialogsCmd(), m.tickCmd()) }
+func (m Model) Init() tea.Cmd { return tea.Batch(m.dialogsCmd(), m.tickCmd(), m.callTickCmd()) }
 
 func (m Model) tickCmd() tea.Cmd {
 	if m.opts.PollInterval < 0 {
 		return nil
 	}
-	return tea.Tick(m.opts.PollInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
+	generation := m.pollGeneration
+	delay := max(m.opts.PollInterval, time.Until(m.pollRetryAt))
+	return tea.Tick(delay, func(t time.Time) tea.Msg { return pollTickMsg{generation, t} })
 }
 
 func (m Model) dialogsCmd() tea.Cmd {
@@ -121,19 +165,7 @@ func (m Model) dialogsCmd() tea.Cmd {
 }
 
 func (m *Model) fetchHistory() tea.Cmd {
-	chat, ok := m.currentChat()
-	if !ok {
-		return nil
-	}
-	m.historyRequest++
-	m.loading = true
-	client, parent, query, request := m.client, m.ctx, m.query, m.historyRequest
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-		defer cancel()
-		messages, err := client.History(ctx, chat, query)
-		return historyMsg{request, chat.ID, messages, err}
-	}
+	return m.requestHistory(historyRefresh)
 }
 
 func (m *Model) selectChat(index int) tea.Cmd {
@@ -145,6 +177,7 @@ func (m *Model) selectChat(index int) tea.Cmd {
 		return nil
 	}
 	m.chatIndex = index
+	m.history.loaded = false
 	m.messages = nil
 	m.messageIndex = 0
 	m.query, m.failure, m.preview = "", "", ""
@@ -190,10 +223,6 @@ func (m *Model) runOperation(operation string, chat core.Chat, call func(context
 
 func (m *Model) searchContacts() tea.Cmd {
 	query := strings.TrimSpace(m.input)
-	if query == "" {
-		m.setFailure("input", "Enter a contact name or public username")
-		return nil
-	}
 	m.contactsRequest++
 	request, client, parent := m.contactsRequest, m.client, m.ctx
 	m.contacts = nil
@@ -253,19 +282,61 @@ func (m *Model) loadImage() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Call controls are an overlay: background results still belong to the
+	// underlying composer, picker, preview, or management form.
+	if m.mode == callPanel {
+		switch msg.(type) {
+		case tea.KeyMsg, tea.WindowSizeMsg, callStateMsg, callOperationMsg:
+		default:
+			obscured := m.historyObscured
+			m.historyObscured = true
+			m.mode = m.callReturnMode
+			next, cmd := m.Update(msg)
+			m = next.(Model)
+			m.callReturnMode, m.mode = m.mode, callPanel
+			m.historyObscured = obscured
+			return m, cmd
+		}
+	}
 	switch msg := msg.(type) {
+	case historyPageMsg:
+		return m.updateHistoryPage(msg)
+	case readStateMsg:
+		return m.updateReadState(msg)
+	case pollTickMsg:
+		if msg.generation != m.pollGeneration {
+			return m, nil
+		}
+		return m.Update(tickMsg(msg.time))
+	case organizationMsg:
+		return m.updateOrganization(msg)
+	case settingsSavedMsg:
+		return m.updateSettingsSaved(msg)
+	case callStateMsg:
+		m.applyCallState(msg.state)
+		return m, m.callTickCmd()
+	case callOperationMsg:
+		return m.updateCallOperation(msg)
+	case uploadResultMsg:
+		return m.updateUpload(msg)
+	case managementMsg:
+		return m.updateManagement(msg)
+	case mediaResultMsg:
+		return m.updateMedia(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
-		return m, nil
+		cmd := m.markVisibleRead()
+		return m, cmd
 	case tickMsg:
 		if m.ctx.Err() != nil {
 			return m, nil
 		}
-		if m.mode != normal || m.busy || m.loading || m.dialogsPending {
+		if m.mode != normal || m.busy || m.loading || m.dialogsPending || time.Now().Before(m.pollRetryAt) {
 			return m, m.tickCmd()
 		}
 		m.dialogsRequest++
 		m.dialogsPending = true
+		m.backgroundDialogs = m.dialogsRequest
 		return m, tea.Batch(m.dialogsCmd(), m.tickCmd())
 	case dialogsMsg:
 		if msg.request != m.dialogsRequest {
@@ -274,10 +345,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dialogsPending = false
 		if msg.err != nil {
 			m.loading = false
+			m.deferPolling(msg.err)
 			m.setFailure("dialogs", msg.err.Error())
 			return m, nil
 		}
 		m.clearFailure("dialogs")
+		forwardID := ""
+		if m.mode == forwardPicker && m.pickerIndex < len(m.forwardChats()) {
+			forwardID = m.forwardChats()[m.pickerIndex].ID
+		}
 		old, hadOld := m.currentChat()
 		// Keep search-opened conversations until the server includes them.
 		if hadOld {
@@ -292,14 +368,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				msg.chats = append([]core.Chat{old}, msg.chats...)
 			}
 		}
-		m.chats = msg.chats
-		m.chatIndex = 0
-		if hadOld {
-			for i, chat := range m.chats {
-				if chat.ID == old.ID {
-					m.chatIndex = i
+		m.installDialogs(msg.chats)
+		if forwardID != "" {
+			found := false
+			for i, chat := range m.forwardChats() {
+				if chat.ID == forwardID {
+					m.pickerIndex = i
+					found = true
 					break
 				}
+			}
+			if !found {
+				m.mode = normal
+				m.setFailure("forward", "Forward destination is no longer available; select it again")
 			}
 		}
 		if len(m.chats) == 0 {
@@ -308,15 +389,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.status = fmt.Sprintf("%d conversations", len(m.chats))
+		// A dialog refresh must not supersede an explicit page/search request
+		// already loading for this same conversation.
+		if m.loading {
+			return m, nil
+		}
+		// A search is an explicit query, not a subscription. Repeating it on
+		// every background dialog poll wastes Telegram's search quota. R still
+		// refreshes it, and pagination remains available on demand.
+		if msg.request == m.backgroundDialogs && m.query != "" {
+			return m, nil
+		}
 		cmd := m.fetchHistory()
+		if cmd == nil {
+			// Historical windows intentionally skip history polling, but a
+			// failed visible read receipt still needs a retry after its backoff.
+			cmd = m.markVisibleRead()
+		}
 		return m, cmd
 	case historyMsg:
 		chat, ok := m.currentChat()
 		if !ok || msg.chatID != chat.ID || msg.request != m.historyRequest {
 			return m, nil
 		}
+		m.cancelHistory()
 		m.loading = false
 		if msg.err != nil {
+			m.deferPolling(msg.err)
 			m.setFailure("history", msg.err.Error())
 			return m, nil
 		}
@@ -333,7 +432,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		return m, nil
+		cmd := m.markVisibleRead()
+		return m, cmd
 	case contactsMsg:
 		if msg.request != m.contactsRequest || m.mode != contactPicker {
 			return m, nil
@@ -373,9 +473,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input = ""
 			delete(m.drafts, msg.chatID)
 			m.mode = normal
+			m.query = ""
+			m.history.loaded = false
+		}
+		if msg.operation == "Adding contact" {
+			for i := range m.chats {
+				if m.chats[i].ID == msg.chatID {
+					m.chats[i].Contact = true
+				}
+			}
+			for i := range m.allChats {
+				if m.allChats[i].ID == msg.chatID {
+					m.allChats[i].Contact = true
+				}
+			}
+			return m, nil
 		}
 		if chat, ok := m.currentChat(); ok && chat.ID == msg.chatID {
-			cmd := m.fetchHistory()
+			cmd := m.refreshHistoryWindow()
 			return m, cmd
 		}
 		return m, nil
@@ -388,11 +503,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := key.String()
 	if k == "ctrl+c" {
+		m.cancelHistory()
+		if m.uploadCancel != nil {
+			m.uploadCancel()
+		}
+		m.stopMedia()
 		return m, tea.Quit
 	}
+	if k == "ctrl+g" {
+		m.openCallPanel()
+		return m, nil
+	}
+	if k == "ctrl+x" {
+		cmd := m.callCommand("end")
+		return m, cmd
+	}
+	if m.mode == callPanel {
+		return m.updateCallKey(key)
+	}
 	if k == "esc" {
-		if m.busy && m.mode == compose {
-			m.status = "Sending message; wait for the result"
+		if m.uploadCancel != nil {
+			m.uploadCancel()
+			m.status = "Cancelling upload…"
+			return m, nil
+		}
+		if m.mediaCancel != nil {
+			m.stopMedia()
+			m.status = "Media action cancelled"
+			return m, nil
+		}
+		if m.busy {
+			m.status = "Action in progress; wait for the result"
 			return m, nil
 		}
 		m.failure, m.preview = "", ""
@@ -401,21 +542,58 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pendingG = false
 		if m.mode != normal {
 			m.mode = normal
+			m.selectingGroup = false
 			m.loading = false
-			return m, nil
+			cmd := m.markVisibleRead()
+			return m, cmd
 		}
 		if m.query != "" {
 			m.query = ""
+			m.history.loaded = false
+			m.messages = nil
+			m.messageIndex = 0
 			cmd := m.fetchHistory()
 			return m, cmd
 		}
 		return m, nil
+	}
+	if m.mode == manageForm {
+		return m.updateForm(key)
+	}
+	if m.mode == settingsPanel {
+		return m.updateSettingsKey(key)
+	}
+	if m.mode == organizationPanel {
+		return m.updateOrganizationKey(key)
+	}
+	if m.mode == reactionPicker {
+		return m.updateReactions(key)
+	}
+	if m.mode == confirmAction {
+		return m.updateConfirmation(key)
 	}
 	if m.mode == help || m.mode == imagePreview {
 		if k == "q" || k == "enter" || k == "?" {
 			m.mode = normal
 			m.preview = ""
 			m.imageRequest++
+		}
+		if m.mode == help {
+			switch k {
+			case "j", "down":
+				m.viewOffset++
+			case "k", "up":
+				m.viewOffset--
+			case "ctrl+d", "pgdown":
+				m.viewOffset += max(1, m.height-9)
+			case "ctrl+u", "pgup":
+				m.viewOffset -= max(1, m.height-9)
+			case "home", "g":
+				m.viewOffset = 0
+			case "end", "G":
+				m.viewOffset = len(m.helpLines())
+			}
+			m.viewOffset = max(0, min(m.viewOffset, max(0, len(m.helpLines())-max(1, m.height-8))))
 		}
 		return m, nil
 	}
@@ -447,14 +625,43 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.mode == contactPicker || m.mode == forwardPicker {
 		return m.updatePicker(key)
 	}
+	if m.busy {
+		return m, nil
+	}
+	k = m.actionKey(k)
 	if k != "g" {
 		m.pendingG = false
 	}
 	switch k {
 	case "q":
+		m.cancelHistory()
+		m.stopMedia()
 		return m, tea.Quit
 	case "?":
 		m.mode = help
+		m.viewOffset = 0
+	case ",":
+		m.openSettings()
+	case "o":
+		cmd := m.openOrganization()
+		return m, cmd
+	case "u":
+		cmd := m.toggleUnreadFilter()
+		return m, cmd
+	case "[", "]", "B", "L":
+		m.focus = 1
+		var cmd tea.Cmd
+		switch k {
+		case "[":
+			cmd = m.loadOlderHistory()
+		case "]":
+			cmd = m.loadNewerHistory()
+		case "B":
+			cmd = m.jumpHistory(true)
+		case "L":
+			cmd = m.jumpHistory(false)
+		}
+		return m, cmd
 	case "tab":
 		m.focus = 1 - m.focus
 	case "h", "left":
@@ -472,8 +679,20 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "k", "up":
 			index--
 		case "G", "end":
+			if m.focus == 1 {
+				if _, ok := m.client.(core.HistoryClient); ok {
+					cmd := m.jumpHistory(false)
+					return m, cmd
+				}
+			}
 			index = count - 1
 		case "home":
+			if m.focus == 1 {
+				if _, ok := m.client.(core.HistoryClient); ok {
+					cmd := m.jumpHistory(true)
+					return m, cmd
+				}
+			}
 			index = 0
 		case "g":
 			if !m.pendingG {
@@ -481,11 +700,27 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.pendingG = false
+			if m.focus == 1 {
+				if _, ok := m.client.(core.HistoryClient); ok {
+					cmd := m.jumpHistory(true)
+					return m, cmd
+				}
+			}
 			index = 0
 		case "pgup", "ctrl+u":
 			index -= max(1, (m.height-8)/4)
 		case "pgdown", "ctrl+d":
 			index += max(1, (m.height-8)/4)
+		}
+		if m.focus == 1 {
+			if index < 0 && m.history.hasOlder {
+				cmd := m.loadOlderHistory()
+				return m, cmd
+			}
+			if index >= count && m.history.hasNewer {
+				cmd := m.loadNewerHistory()
+				return m, cmd
+			}
 		}
 		index = max(0, min(index, count-1))
 		if m.focus == 0 {
@@ -505,9 +740,27 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input = m.query
 			m.failure = ""
 		}
-	case "c":
+	case "c", "n":
 		m.mode = contactSearch
+		m.selectingGroup = false
 		m.input, m.failure = "", ""
+	case "N":
+		m.selectingGroup = true
+		m.groupMembers = make(map[string]core.Contact)
+		m.input = ""
+		cmd := m.searchContacts()
+		return m, cmd
+	case "e":
+		m.editChat()
+	case "D":
+		m.confirmChatDeletion()
+	case "C":
+		m.openCallPanel()
+	case "a":
+		m.openAttachment()
+	case "d", "p":
+		cmd := m.startMedia(k == "p")
+		return m, cmd
 	case "f":
 		if message, ok := m.currentMessage(); ok && !m.busy {
 			m.forwardSource, _ = m.currentChat()
@@ -515,12 +768,7 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode, m.pickerIndex = forwardPicker, 0
 		}
 	case "r":
-		if message, ok := m.currentMessage(); ok && !m.busy {
-			chat, _ := m.currentChat()
-			client := m.client
-			cmd := m.runOperation("Adding reaction", chat, func(ctx context.Context) error { return client.React(ctx, chat, message.ID, "👍") })
-			return m, cmd
-		}
+		m.openReactions()
 	case "v":
 		cmd := m.loadImage()
 		return m, cmd
@@ -548,7 +796,8 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dialogsPending = true
 		return m, m.dialogsCmd()
 	}
-	return m, nil
+	cmd := m.markVisibleRead()
+	return m, cmd
 }
 
 func (m Model) updateInput(key tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -579,6 +828,7 @@ func (m Model) updateInput(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.mode == search {
 			m.query = strings.TrimSpace(m.input)
+			m.history.loaded = false
 			m.mode = normal
 			m.messages = nil
 			cmd := m.fetchHistory()
@@ -597,7 +847,7 @@ func (m Model) updateInput(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "ctrl+u":
 		m.input = ""
-	case "space":
+	case " ", "space":
 		if len([]rune(m.input)) < 4096 {
 			m.input += " "
 		}
@@ -624,9 +874,15 @@ func (m Model) updateInput(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updatePicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.busy {
+		return m, nil
+	}
+	if handled, cmd := m.managePickerKey(key); handled {
+		return m, cmd
+	}
 	count := len(m.contacts)
 	if m.mode == forwardPicker {
-		count = len(m.chats)
+		count = len(m.forwardChats())
 	}
 	switch key.String() {
 	case "j", "down":
@@ -654,20 +910,33 @@ func (m Model) updatePicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		contact := m.contacts[m.pickerIndex]
 		client := m.client
-		cmd := m.runOperation("Adding contact", core.Chat{}, func(ctx context.Context) error { return client.AddContact(ctx, contact) })
+		cmd := m.runOperation("Adding contact", core.Chat{ID: contact.ID}, func(ctx context.Context) error { return client.AddContact(ctx, contact) })
 		return m, cmd
 	case "enter":
 		if count == 0 || m.busy {
 			return m, nil
 		}
 		if m.mode == forwardPicker {
-			target := m.chats[m.pickerIndex]
+			target := m.forwardChats()[m.pickerIndex]
 			source, id, client := m.forwardSource, m.forwardMessage, m.client
 			m.mode = normal
 			cmd := m.runOperation("Forwarding message", source, func(ctx context.Context) error { return client.Forward(ctx, source, id, target) })
 			return m, cmd
 		}
 		contact := m.contacts[m.pickerIndex]
+		// Opening a contact is an explicit navigation request, including when its
+		// conversation is archived or hidden by the current folder/unread filter.
+		visible := false
+		for _, chat := range m.chats {
+			if chat.ID == contact.ID {
+				visible = true
+				break
+			}
+		}
+		if !visible && m.allChats != nil {
+			m.organization.folderID, m.organization.unreadOnly = -2, false
+			m.installDialogs(m.allChats)
+		}
 		index := -1
 		for i, chat := range m.chats {
 			if chat.ID == contact.ID {
@@ -676,7 +945,9 @@ func (m Model) updatePicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if index < 0 {
-			m.chats = append(m.chats, core.Chat{ID: contact.ID, Title: contact.Name, Kind: "private"})
+			chat := core.Chat{ID: contact.ID, Title: contact.Name, Kind: "private"}
+			m.chats = append(m.chats, chat)
+			m.allChats = append(m.allChats, chat)
 			index = len(m.chats) - 1
 		}
 		m.mode, m.focus = normal, 1

@@ -11,19 +11,25 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/paramon-tech/tuigram/internal/storage"
 )
 
 type Config struct {
-	AppID         int    `json:"app_id"`
-	AppHash       string `json:"app_hash"`
-	Theme         string `json:"theme"`
-	CacheDir      string `json:"cache_dir"`
-	StateDir      string `json:"state_dir"`
-	CacheMaxBytes int64  `json:"cache_max_bytes"`
-	CacheTTLHours int    `json:"cache_ttl_hours"`
-	PollSeconds   int    `json:"poll_seconds"`
+	AppID           int               `json:"app_id"`
+	AppHash         string            `json:"app_hash"`
+	Theme           string            `json:"theme"`
+	CacheDir        string            `json:"cache_dir"`
+	StateDir        string            `json:"state_dir"`
+	CacheMaxBytes   int64             `json:"cache_max_bytes"`
+	CacheTTLHours   int               `json:"cache_ttl_hours"`
+	PollSeconds     int               `json:"poll_seconds"`
+	CallInputFormat string            `json:"call_input_format,omitempty"`
+	CallInputDevice string            `json:"call_input_device,omitempty"`
+	DownloadDir     string            `json:"download_dir,omitempty"`
+	MarkRead        bool              `json:"mark_read"`
+	KeyBindings     map[string]string `json:"key_bindings,omitempty"`
 }
 
 func userDirectory(env string, fallback func() (string, error)) (string, error) {
@@ -48,7 +54,9 @@ func DefaultPath() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
-func Default() (Config, error) {
+func Default() (Config, error) { return defaults(true) }
+
+func defaults(environment bool) (Config, error) {
 	cache, err := userDirectory("XDG_CACHE_HOME", os.UserCacheDir)
 	if err != nil {
 		return Config{}, err
@@ -63,9 +71,11 @@ func Default() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Theme: "midnight", CacheDir: cache, StateDir: state, CacheMaxBytes: 32 << 20, CacheTTLHours: 24, PollSeconds: 5}
-	if err := c.applyEnvironment(); err != nil {
-		return Config{}, err
+	c := Config{Theme: "midnight", CacheDir: cache, StateDir: state, CacheMaxBytes: 32 << 20, CacheTTLHours: 24, PollSeconds: 15, MarkRead: true}
+	if environment {
+		if err := c.applyEnvironment(); err != nil {
+			return Config{}, err
+		}
 	}
 	return c, c.Validate()
 }
@@ -85,6 +95,17 @@ func (c *Config) applyEnvironment() error {
 }
 
 func (c Config) Validate() error {
+	if err := c.Preferences().Validate(); err != nil {
+		return err
+	}
+	switch c.CallInputFormat {
+	case "", "avfoundation", "pulse", "alsa", "oss", "sndio", "dshow":
+	default:
+		return errors.New("call_input_format must be avfoundation, pulse, alsa, oss, sndio, or dshow")
+	}
+	if len(c.CallInputDevice) > 256 || strings.ContainsAny(c.CallInputDevice, "\x00\r\n") {
+		return errors.New("call_input_device must be a device name or index of at most 256 bytes")
+	}
 	if c.AppID < 0 || c.AppID > 2147483647 {
 		return errors.New("app_id must fit a positive 32-bit integer, or be zero when unset")
 	}
@@ -122,8 +143,10 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func Load(path string) (Config, error) {
-	c, err := Default()
+func Load(path string) (Config, error) { return load(path, true) }
+
+func load(path string, environment bool) (Config, error) {
+	c, err := defaults(environment)
 	if err != nil {
 		return Config{}, err
 	}
@@ -152,8 +175,10 @@ func Load(path string) (Config, error) {
 	if err := dec.Decode(&extra); err != io.EOF {
 		return Config{}, errors.New("configuration must contain exactly one JSON object")
 	}
-	if err := c.applyEnvironment(); err != nil {
-		return Config{}, err
+	if environment {
+		if err := c.applyEnvironment(); err != nil {
+			return Config{}, err
+		}
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err

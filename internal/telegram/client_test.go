@@ -57,7 +57,19 @@ func TestHistoryConvertsMessagesAndSearchUsesCorrectPeer(t *testing.T) {
 func TestDialogsPaginatesAndDeduplicates(t *testing.T) {
 	calls := 0
 	c := testClient(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		switch input.(type) {
+		case *tg.AccountGetNotifySettingsRequest:
+			return nil
+		case *tg.MessagesGetPinnedDialogsRequest:
+			return nil
+		case *tg.MessagesGetDialogFiltersRequest:
+			return nil
+		}
 		request := input.(*tg.MessagesGetDialogsRequest)
+		if request.FolderID == 1 {
+			output.(*tg.MessagesDialogsBox).Dialogs = &tg.MessagesDialogs{}
+			return nil
+		}
 		calls++
 		switch calls {
 		case 1:

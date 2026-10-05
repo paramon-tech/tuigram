@@ -37,7 +37,8 @@ CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" go build \
   -mod=readonly -trimpath -buildvcs=false \
   -ldflags "-s -w -X main.version=$release_version -X main.commit=$build_commit -X main.buildDate=$build_date" \
   -o "$stage/$archive_name/tuigram" ./cmd/tuigram
-cp LICENSE README.md SECURITY.md "$stage/$archive_name/"
+cp LICENSE README.md CHANGELOG.md SECURITY.md "$stage/$archive_name/"
+cp internal/tgcalls/LICENSE "$stage/$archive_name/LICENSE-gotd-calls"
 cp -R docs "$stage/$archive_name/"
 COPYFILE_DISABLE=1 tar -czf "$output_dir/$archive_name.tar.gz" -C "$stage" "$archive_name"
 echo "$output_dir/$archive_name.tar.gz"

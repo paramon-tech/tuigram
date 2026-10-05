@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
-	calls "github.com/paramon-tech/tuigram/internal/tgcalls"
 	"github.com/gotd/td/tg"
 	"github.com/paramon-tech/tuigram/internal/core"
 	"github.com/paramon-tech/tuigram/internal/platform"
+	calls "github.com/paramon-tech/tuigram/internal/tgcalls"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"

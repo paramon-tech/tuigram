@@ -3,7 +3,7 @@ VERSION ?= dev
 GOOS ?= $(shell $(GO) env GOOS)
 GOARCH ?= $(shell $(GO) env GOARCH)
 
-.PHONY: build run demo test race vet fmt check smoke vuln package
+.PHONY: build run demo test race vet fmt fmt-check check smoke vuln package
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-X main.version=$(VERSION)" -o bin/tuigram ./cmd/tuigram
@@ -26,7 +26,14 @@ vet:
 fmt:
 	gofmt -w cmd internal
 
-check: vet race smoke
+fmt-check:
+	@unformatted=$$(gofmt -l cmd internal) || exit $$?; \
+	if [ -n "$$unformatted" ]; then \
+		printf '%s\n' "$$unformatted"; \
+		exit 1; \
+	fi
+
+check: fmt-check vet race smoke
 
 smoke: build
 	bash scripts/smoke.sh ./bin/tuigram

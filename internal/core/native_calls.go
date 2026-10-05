@@ -24,6 +24,14 @@ type CallState struct {
 	Muted     bool
 	Error     string
 	StartedAt time.Time // Set when the media transport connects.
+	// Packet counts report transport/queue activity, not audible speaker output.
+	SentPackets     uint64
+	ReceivedPackets uint64
+	// Decoder activity and level do not prove that the output device is audible.
+	AudioDecodedFrames uint64
+	AudioLevelDB       float64
+	AudioLastDecodedAt time.Time
+	AudioOutputError   string
 }
 
 func (s CallState) Active() bool {

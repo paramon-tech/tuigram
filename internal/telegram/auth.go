@@ -79,6 +79,7 @@ func Run(ctx context.Context, opts Options, fn func(context.Context, core.Client
 	client := gotd.NewClient(opts.AppID, opts.AppHash, gotd.Options{
 		SessionStorage: opts.SessionStorage,
 		UpdateHandler:  dispatcher,
+		Middlewares:    []gotd.Middleware{newFloodGate()},
 	})
 	return client.Run(ctx, func(ctx context.Context) error {
 		status, err := client.Auth().Status(ctx)

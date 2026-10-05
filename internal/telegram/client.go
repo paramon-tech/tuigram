@@ -43,6 +43,9 @@ type client struct {
 	native           *nativeCalls
 	notifyDefaults   map[string]bool
 	notifyDefaultsAt time.Time
+	dialogFilters    *tg.MessagesDialogFilters
+	dialogFiltersAt  time.Time
+	filterGeneration uint64
 }
 
 var _ core.Client = (*client)(nil)

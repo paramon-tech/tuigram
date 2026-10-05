@@ -34,7 +34,7 @@ func TestDefaultsAndMissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Theme != "midnight" || c.CacheMaxBytes != 32<<20 || c.CacheTTLHours != 24 || c.PollSeconds != 5 {
+	if c.Theme != "midnight" || c.CacheMaxBytes != 32<<20 || c.CacheTTLHours != 24 || c.PollSeconds != 15 {
 		t.Fatalf("wrong defaults: %+v", c)
 	}
 	if c.CacheDir != filepath.Join(dir, "cache", "tuigram") || c.StateDir != filepath.Join(dir, "state", "tuigram") {
@@ -115,7 +115,7 @@ func TestPartialConfigurationRetainsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Theme != "light" || c.CacheMaxBytes != 32<<20 || c.PollSeconds != 5 {
+	if c.Theme != "light" || c.CacheMaxBytes != 32<<20 || c.PollSeconds != 15 {
 		t.Fatalf("partial config: %+v", c)
 	}
 }

@@ -71,7 +71,7 @@ func defaults(environment bool) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Theme: "midnight", CacheDir: cache, StateDir: state, CacheMaxBytes: 32 << 20, CacheTTLHours: 24, PollSeconds: 5, MarkRead: true}
+	c := Config{Theme: "midnight", CacheDir: cache, StateDir: state, CacheMaxBytes: 32 << 20, CacheTTLHours: 24, PollSeconds: 15, MarkRead: true}
 	if environment {
 		if err := c.applyEnvironment(); err != nil {
 			return Config{}, err

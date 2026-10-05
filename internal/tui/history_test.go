@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/paramon-tech/tuigram/internal/core"
 )
@@ -169,8 +170,12 @@ func TestFailedReadKeepsUnreadAndCanRetry(t *testing.T) {
 	if m.chats[0].Unread != 3 || again != nil || m.failureKind != "read" {
 		t.Fatal("failed read hid unread count or retried in a loop")
 	}
+	if m.markVisibleRead() != nil {
+		t.Fatal("failed read retried before its backoff elapsed")
+	}
+	m.history.readRetryAt["one"] = time.Now().Add(-time.Second)
 	if m.markVisibleRead() == nil {
-		t.Fatal("failed read cannot retry")
+		t.Fatal("failed read cannot retry after its backoff")
 	}
 }
 

@@ -81,7 +81,7 @@ func TestCLIValidation(t *testing.T) {
 func TestAudioDiagnosticsDoNotRequireTelegramCredentials(t *testing.T) {
 	cliEnvironment(t)
 	t.Setenv("PATH", t.TempDir())
-	for _, command := range []string{"check", "devices"} {
+	for _, command := range []string{"check", "devices", "speaker-test"} {
 		var out bytes.Buffer
 		err := run(context.Background(), []string{"audio", command}, os.Stdin, &out, &out)
 		if err == nil || !strings.Contains(err.Error(), "FFmpeg") || strings.Contains(err.Error(), "TUIGRAM_API_ID") {

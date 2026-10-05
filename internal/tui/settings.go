@@ -28,7 +28,7 @@ func (m Model) preferences() config.Preferences {
 	p.Theme, p.DownloadDir, p.MarkRead = m.opts.Theme, m.opts.DownloadDir, !m.opts.DisableAutoRead
 	p.PollSeconds = int(m.opts.PollInterval / time.Second)
 	if p.PollSeconds < 2 {
-		p.PollSeconds = 5
+		p.PollSeconds = 15
 	}
 	return p
 }

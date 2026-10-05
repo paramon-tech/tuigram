@@ -1,0 +1,18 @@
+Source: https://github.com/gotd/td/tree/v0.162.0/telegram/calls
+Version: github.com/gotd/td v0.162.0 (the version pinned in go.mod/go.sum)
+License: MIT; original copyright and license are retained in LICENSE.
+
+This directory contains the upstream one-to-one call implementation and its
+tests. Group calls are omitted. Tuigram carries this narrow copy because the
+upstream public API does not expose channel-negotiation overrides.
+
+Local changes correct V2 channel negotiation against Telegram's official
+tgcalls implementation: answers acknowledge the offered sending SSRC; the
+other direction is advertised by an independent offer. Tests cover official
+answer semantics and independent offers in addition to local RTP loopback.
+
+Reference: https://github.com/TelegramMessenger/tgcalls/blob/development/tgcalls/v2/ContentNegotiation.cpp
+
+Keep transport changes small and reconcile this directory when the upstream
+implementation supports these exchanges. The rest of gotd stays a normal
+versioned module dependency.

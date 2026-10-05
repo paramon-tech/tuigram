@@ -110,6 +110,7 @@ func (m *Model) installOrganizationDialogs(chats []core.Chat, preserveReadSelect
 	m.query = ""
 	m.preview = ""
 	m.historyRequest++
+	m.cancelHistory()
 	m.imageRequest++
 	m.loading = false
 }

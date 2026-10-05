@@ -26,6 +26,35 @@ type historyState struct {
 	oldestID, newestID         int
 	hasOlder, hasNewer, loaded bool
 	readPending, readConfirmed map[string]int
+	readRetryAt                map[string]time.Time
+	pending                    *historyFetch
+}
+
+type historyFetch struct {
+	chatID, query string
+	action        historyAction
+	request       core.HistoryRequest
+	cancel        context.CancelFunc
+}
+
+func (m *Model) cancelHistory() {
+	if m.history.pending != nil {
+		m.history.pending.cancel()
+		m.history.pending = nil
+	}
+}
+
+// A held navigation key should share its outstanding request. Changing chat,
+// search, or page instead cancels obsolete work rather than merely discarding
+// its response after Telegram has already served it.
+func (m *Model) beginHistory(chatID string, action historyAction, request core.HistoryRequest) (context.Context, context.CancelFunc) {
+	if pending := m.history.pending; pending != nil && pending.chatID == chatID && pending.query == m.query && pending.action == action && pending.request == request {
+		return nil, nil
+	}
+	m.cancelHistory()
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	m.history.pending = &historyFetch{chatID: chatID, query: m.query, action: action, request: request, cancel: cancel}
+	return ctx, cancel
 }
 
 type historyPageMsg struct {
@@ -55,12 +84,18 @@ func (m *Model) requestHistory(action historyAction) tea.Cmd {
 			m.status = "This connection does not support history pagination"
 			return nil
 		}
+		ctx, cancel := m.beginHistory(chat.ID, action, core.HistoryRequest{Query: m.query})
+		if ctx == nil {
+			return nil
+		}
 		m.historyRequest++
 		m.loading = true
-		legacy, parent, request, query := m.client, m.ctx, m.historyRequest, m.query
+		legacy, request, query := m.client, m.historyRequest, m.query
 		return func() tea.Msg {
-			ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 			defer cancel()
+			if err := ctx.Err(); err != nil {
+				return historyMsg{request: request, chatID: chat.ID, err: err}
+			}
 			messages, err := legacy.History(ctx, chat, query)
 			return historyMsg{request, chat.ID, messages, err}
 		}
@@ -90,12 +125,18 @@ func (m *Model) requestHistory(action historyAction) tea.Cmd {
 			request.BeforeID = message.ID + 1
 		}
 	}
+	ctx, cancel := m.beginHistory(chat.ID, action, request)
+	if ctx == nil {
+		return nil
+	}
 	m.historyRequest++
 	m.loading = true
-	parent, generation, query := m.ctx, m.historyRequest, m.query
+	generation, query := m.historyRequest, m.query
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 		defer cancel()
+		if err := ctx.Err(); err != nil {
+			return historyPageMsg{request: generation, chatID: chat.ID, query: query, action: action, err: err}
+		}
 		page, err := client.HistoryPage(ctx, chat, request)
 		return historyPageMsg{request: generation, chatID: chat.ID, query: query, action: action, page: page, boundary: request.BeforeID, err: err}
 	}
@@ -124,8 +165,10 @@ func (m Model) updateHistoryPage(msg historyPageMsg) (tea.Model, tea.Cmd) {
 	if !ok || msg.chatID != chat.ID || msg.query != m.query || msg.request != m.historyRequest {
 		return m, nil
 	}
+	m.cancelHistory()
 	m.loading = false
 	if msg.err != nil {
+		m.deferPolling(msg.err)
 		m.setFailure("history", msg.err.Error())
 		return m, nil
 	}
@@ -247,6 +290,9 @@ func (m *Model) markVisibleRead() tea.Cmd {
 	if !ok {
 		return nil
 	}
+	if time.Now().Before(m.history.readRetryAt[chat.ID]) {
+		return nil
+	}
 	if _, paged := m.client.(core.HistoryClient); paged && (!m.history.loaded || m.history.chatID != chat.ID || m.history.query != "") {
 		return nil
 	}
@@ -282,11 +328,20 @@ func (m Model) updateReadState(msg readStateMsg) (tea.Model, tea.Cmd) {
 	}
 	delete(m.history.readPending, msg.chatID)
 	if msg.err != nil {
+		if m.history.readRetryAt == nil {
+			m.history.readRetryAt = make(map[string]time.Time)
+		}
+		delay := retryAfter(msg.err)
+		if delay <= 0 {
+			delay = 30 * time.Second
+		}
+		m.history.readRetryAt[msg.chatID] = time.Now().Add(delay)
 		if chat, ok := m.currentChat(); ok && chat.ID == msg.chatID {
 			m.setFailure("read", msg.err.Error())
 		}
 		return m, nil
 	}
+	delete(m.history.readRetryAt, msg.chatID)
 	m.clearFailure("read")
 	// A dialogs request started before the receipt may return its old unread
 	// count afterward. Its response cannot overwrite this newer snapshot.

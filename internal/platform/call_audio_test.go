@@ -1,19 +1,140 @@
 package platform
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// An alive ffplay process does not prove that incoming audio is decoded: a
+// player waiting for EOF or buffering forever can pass the duplex lifetime
+// test below. Measure real non-silent decoded PCM while the RTP producer and
+// Ogg input remain open, using exactly the live call playback arguments.
+func TestCallAudioDecodesBeforeStreamCloses(t *testing.T) {
+	if os.Getenv("TUIGRAM_TEST_CALL_AUDIO") != "1" {
+		t.Skip("set TUIGRAM_TEST_CALL_AUDIO=1 with FFmpeg installed for synthetic playback test")
+	}
+	ffmpeg, ffplay, err := callAudioTools()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SDL_AUDIODRIVER", "dummy")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	player := exec.CommandContext(ctx, ffplay, playbackCallArgs()...)
+	var playerStderr bytes.Buffer
+	player.Stderr = &playerStderr
+	input, err := player.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	output, err := player.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := player.Start(); err != nil {
+		t.Fatal(err)
+	}
+	playerDone := make(chan struct{})
+	var playerErr error
+	go func() {
+		playerErr = player.Wait()
+		close(playerDone)
+	}()
+	defer func() { cancel(); <-playerDone }()
+
+	decoded := make(chan float64, 16)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		scanner := bufio.NewScanner(output)
+		for scanner.Scan() {
+			level, ok := strings.CutPrefix(scanner.Text(), "lavfi.astats.Overall.RMS_level=")
+			if !ok {
+				continue
+			}
+			rms, err := strconv.ParseFloat(level, 64)
+			if err == nil && !math.IsNaN(rms) && !math.IsInf(rms, 0) && rms > -60 {
+				select {
+				case decoded <- rms:
+				default:
+				}
+			}
+		}
+	}()
+	defer func() { cancel(); <-readerDone }()
+
+	a := &CallAudio{ctx: ctx, cancel: cancel, socket: socket, input: input,
+		incoming: make(chan opusRTP, 16), errors: make(chan error, 1)}
+	bridgeDone := make(chan struct{})
+	go func() {
+		defer close(bridgeDone)
+		a.playback()
+	}()
+	captureDone := make(chan struct{})
+	go func() {
+		defer close(captureDone)
+		a.capture(a.WriteRTP)
+	}()
+	defer func() {
+		cancel()
+		input.Close()
+		socket.Close()
+		<-bridgeDone
+		<-captureDone
+	}()
+
+	producer := exec.CommandContext(ctx, ffmpeg, captureCallArgs(
+		[]string{"-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"},
+		socket.LocalAddr().(*net.UDPAddr).Port)...)
+	var producerStderr bytes.Buffer
+	producer.Stderr = &producerStderr
+	if err := producer.Start(); err != nil {
+		t.Fatal(err)
+	}
+	producerDone := make(chan struct{})
+	var producerErr error
+	go func() {
+		producerErr = producer.Wait()
+		close(producerDone)
+	}()
+	defer func() { cancel(); <-producerDone }()
+
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for frame := 0; frame < 10; {
+		select {
+		case <-decoded:
+			frame++
+		case err := <-a.Errors():
+			t.Fatalf("audio bridge failed: %v", err)
+		case <-playerDone:
+			t.Fatalf("player exited before live playback: %v: %s", playerErr, playerStderr.String())
+		case <-producerDone:
+			t.Fatalf("tone producer exited before live playback: %v: %s", producerErr, producerStderr.String())
+		case <-deadline.C:
+			t.Fatalf("only %d non-silent frames decoded while call stream remained open", frame)
+		}
+	}
+}
 
 func TestCallInputDefaultsAndValidation(t *testing.T) {
 	for _, tc := range []struct{ os, format, device string }{
@@ -232,6 +353,9 @@ func TestCallAudioSyntheticLoopback(t *testing.T) {
 	}
 	if sent.Load() < 10 {
 		t.Fatalf("microphone simulator produced only %d packets", sent.Load())
+	}
+	if state := a.OutputState(); state.DecodedFrames < 10 || state.LevelDB < -60 || state.LastDecodedAt.IsZero() || state.Error != "" {
+		t.Fatalf("live speaker did not decode non-silent audio: %+v", state)
 	}
 	a.SetMuted(true)
 	time.Sleep(40 * time.Millisecond) // allow any in-flight callback to finish

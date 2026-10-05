@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -198,6 +199,26 @@ func (m Model) callText() string {
 			microphone = "off — answer to enable"
 		}
 		lines = append(lines, "Microphone: "+microphone)
+		if m.call.Status == "active" {
+			if m.call.SentPackets == 0 {
+				lines = append(lines, "Outgoing audio: waiting for microphone packets")
+			} else {
+				lines = append(lines, fmt.Sprintf("Outgoing audio: sent %d packets", m.call.SentPackets))
+			}
+			if m.call.ReceivedPackets == 0 {
+				lines = append(lines, "Incoming audio: waiting for remote packets")
+			} else {
+				lines = append(lines, fmt.Sprintf("Incoming audio: received %d packets", m.call.ReceivedPackets))
+			}
+			lines = append(lines, decodedCallAudioText(m.call))
+			if outputError := callAudioErrorLine(m.call.AudioOutputError); outputError != "" {
+				width := 96
+				if m.width > 0 {
+					width = min(width, max(1, m.width-4))
+				}
+				lines = append(lines, fitLine("Audio output: "+outputError, width))
+			}
+		}
 		if !m.call.StartedAt.IsZero() {
 			seconds := max(0, int(time.Since(m.call.StartedAt).Seconds()))
 			lines = append(lines, fmt.Sprintf("Duration: %02d:%02d", seconds/60, seconds%60))
@@ -221,6 +242,38 @@ func (m Model) callText() string {
 	}
 	lines = append(lines, "", "Esc returns to chat; an active call continues.", "Ctrl+g opens these controls · Ctrl+x ends the call.")
 	return strings.Join(lines, "\n")
+}
+
+func decodedCallAudioText(state core.CallState) string {
+	status := "waiting"
+	if state.AudioDecodedFrames > 0 {
+		switch level := state.AudioLevelDB; {
+		case math.IsInf(level, -1):
+			status = "silence (-Inf dBFS)"
+		case math.IsNaN(level) || math.IsInf(level, 1):
+			status = "level unavailable"
+		case level < -60:
+			status = fmt.Sprintf("very quiet (%.1f dBFS)", level)
+		default:
+			status = fmt.Sprintf("signal (%.1f dBFS)", level)
+		}
+		if !state.AudioLastDecodedAt.IsZero() && time.Since(state.AudioLastDecodedAt) > 2*time.Second {
+			status += " · stalled"
+		}
+	}
+	return "Decoded audio: " + status
+}
+
+func callAudioErrorLine(text string) string {
+	// A decoder may log several diagnostics without exiting. Retain the last
+	// nonempty sanitized line and let the panel clip it to one display line.
+	lines := strings.Split(strings.TrimSpace(Sanitize(text)), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 // ShutdownCalls stops the microphone and sends hang-up before transport teardown.

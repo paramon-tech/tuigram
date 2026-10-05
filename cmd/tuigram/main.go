@@ -54,7 +54,7 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 	callInputDevice := flags.String("call-input-device", "", "microphone name/index (default: system default)")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	flags.Usage = func() {
-		fmt.Fprintln(errOut, "Usage: tuigram [flags] [config init | cache stats | cache clear | audio devices | audio check]\n\nA keyboard-driven Telegram client. Start with --demo; press ? for keys.\nFlags must precede commands.")
+		fmt.Fprintln(errOut, "Usage: tuigram [flags] [config init | cache stats | cache clear | audio devices | audio check | audio speaker-test]\n\nA keyboard-driven Telegram client. Start with --demo; press ? for keys.\nFlags must precede commands.")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -71,7 +71,7 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 		return errors.New("--snapshot requires --demo")
 	}
 	command := strings.Join(flags.Args(), " ")
-	if command != "" && command != "config init" && command != "cache stats" && command != "cache clear" && command != "audio devices" && command != "audio check" {
+	if command != "" && command != "config init" && command != "cache stats" && command != "cache clear" && command != "audio devices" && command != "audio check" && command != "audio speaker-test" {
 		return fmt.Errorf("unknown command %q; use --help", command)
 	}
 	cfg, err := config.Load(*configPath)
@@ -91,6 +91,14 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 		return err
 	}
 	callAudio := platform.CallAudioOptions{InputFormat: cfg.CallInputFormat, InputDevice: cfg.CallInputDevice}
+	if command == "audio speaker-test" {
+		fmt.Fprintln(out, "Playing a quiet two-second tone through the system output...")
+		if err := platform.PlaySpeakerTest(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "Speaker test finished. If you heard no tone, check the system output device and volume.")
+		return nil
+	}
 	if command == "audio devices" {
 		devices, err := platform.ListCallAudioDevices(ctx, callAudio)
 		if err != nil {

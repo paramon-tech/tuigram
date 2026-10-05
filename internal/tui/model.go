@@ -125,6 +125,8 @@ type Model struct {
 	history                                                       historyState
 	historyObscured                                               bool
 	pollGeneration                                                uint64
+	backgroundDialogs                                             uint64
+	pollRetryAt                                                   time.Time
 }
 
 func New(ctx context.Context, client core.Client, opts Options) Model {
@@ -148,7 +150,8 @@ func (m Model) tickCmd() tea.Cmd {
 		return nil
 	}
 	generation := m.pollGeneration
-	return tea.Tick(m.opts.PollInterval, func(t time.Time) tea.Msg { return pollTickMsg{generation, t} })
+	delay := max(m.opts.PollInterval, time.Until(m.pollRetryAt))
+	return tea.Tick(delay, func(t time.Time) tea.Msg { return pollTickMsg{generation, t} })
 }
 
 func (m Model) dialogsCmd() tea.Cmd {
@@ -328,11 +331,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.ctx.Err() != nil {
 			return m, nil
 		}
-		if m.mode != normal || m.busy || m.loading || m.dialogsPending {
+		if m.mode != normal || m.busy || m.loading || m.dialogsPending || time.Now().Before(m.pollRetryAt) {
 			return m, m.tickCmd()
 		}
 		m.dialogsRequest++
 		m.dialogsPending = true
+		m.backgroundDialogs = m.dialogsRequest
 		return m, tea.Batch(m.dialogsCmd(), m.tickCmd())
 	case dialogsMsg:
 		if msg.request != m.dialogsRequest {
@@ -341,6 +345,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dialogsPending = false
 		if msg.err != nil {
 			m.loading = false
+			m.deferPolling(msg.err)
 			m.setFailure("dialogs", msg.err.Error())
 			return m, nil
 		}
@@ -389,15 +394,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loading {
 			return m, nil
 		}
+		// A search is an explicit query, not a subscription. Repeating it on
+		// every background dialog poll wastes Telegram's search quota. R still
+		// refreshes it, and pagination remains available on demand.
+		if msg.request == m.backgroundDialogs && m.query != "" {
+			return m, nil
+		}
 		cmd := m.fetchHistory()
+		if cmd == nil {
+			// Historical windows intentionally skip history polling, but a
+			// failed visible read receipt still needs a retry after its backoff.
+			cmd = m.markVisibleRead()
+		}
 		return m, cmd
 	case historyMsg:
 		chat, ok := m.currentChat()
 		if !ok || msg.chatID != chat.ID || msg.request != m.historyRequest {
 			return m, nil
 		}
+		m.cancelHistory()
 		m.loading = false
 		if msg.err != nil {
+			m.deferPolling(msg.err)
 			m.setFailure("history", msg.err.Error())
 			return m, nil
 		}
@@ -485,6 +503,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := key.String()
 	if k == "ctrl+c" {
+		m.cancelHistory()
 		if m.uploadCancel != nil {
 			m.uploadCancel()
 		}
@@ -615,6 +634,7 @@ func (m Model) updateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch k {
 	case "q":
+		m.cancelHistory()
 		m.stopMedia()
 		return m, tea.Quit
 	case "?":

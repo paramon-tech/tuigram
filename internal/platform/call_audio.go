@@ -178,6 +178,7 @@ type CallAudio struct {
 	incoming chan opusRTP
 	errors   chan error
 	muted    atomic.Bool
+	output   callOutputMonitor
 	wg       sync.WaitGroup
 	done     chan struct{}
 }
@@ -207,6 +208,12 @@ func captureCallArgs(inputArgs []string, port int) []string {
 		"rtp://127.0.0.1:"+strconv.Itoa(port)+"?pkt_size=1200&connect=1")
 }
 
+func playbackCallArgs() []string {
+	return []string{"-hide_banner", "-loglevel", "error", "-nostats", "-nodisp", "-autoexit",
+		"-probesize", "32", "-analyzeduration", "0", "-protocol_whitelist", "pipe", "-f", "ogg", "-i", "pipe:0",
+		"-af", callOutputFilter}
+}
+
 func startCallAudio(ctx context.Context, ffmpeg, ffplay string, inputArgs []string, send func([]byte) error) (*CallAudio, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -221,10 +228,12 @@ func startCallAudio(ctx context.Context, ffmpeg, ffplay string, inputArgs []stri
 		return nil, fmt.Errorf("open local call audio socket: %w", err)
 	}
 	a := &CallAudio{ctx: ctx, cancel: cancel, socket: socket, incoming: make(chan opusRTP, 16), errors: make(chan error, 1), done: make(chan struct{})}
-	player := exec.CommandContext(ctx, ffplay, "-hide_banner", "-loglevel", "error", "-nostats", "-nodisp", "-autoexit",
-		"-probesize", "32", "-analyzeduration", "0", "-protocol_whitelist", "pipe", "-f", "ogg", "-i", "pipe:0")
-	var playerErr, captureErr audioErrorTail
-	player.Stderr = &playerErr
+	player := exec.CommandContext(ctx, ffplay, playbackCallArgs()...)
+	var captureErr audioErrorTail
+	player.Stderr = &a.output.stderr
+	// os/exec drains this scalar-only telemetry pipe and joins its writer
+	// goroutine during Wait; no decoded audio leaves the player.
+	player.Stdout = &a.output
 	a.input, err = player.StdinPipe()
 	if err != nil {
 		cancel()
@@ -255,7 +264,7 @@ func startCallAudio(ctx context.Context, ffmpeg, ffplay string, inputArgs []stri
 	}()
 	go func() {
 		defer a.wg.Done()
-		a.waitProcess(player, &playerErr, "speaker (check your system output device)")
+		a.waitProcess(player, &a.output.stderr, "speaker (check your system output device)")
 	}()
 	go func() {
 		<-ctx.Done()
@@ -351,9 +360,14 @@ func (a *CallAudio) Close() error {
 }
 
 // Keep only the tail; a malfunctioning child must not exhaust application RAM.
-type audioErrorTail struct{ data []byte }
+type audioErrorTail struct {
+	mu   sync.RWMutex
+	data []byte
+}
 
 func (b *audioErrorTail) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	n := len(p)
 	const limit = 4096
 	if n >= limit {
@@ -367,4 +381,8 @@ func (b *audioErrorTail) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func (b *audioErrorTail) String() string { return strings.TrimSpace(string(b.data)) }
+func (b *audioErrorTail) String() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return strings.TrimSpace(string(b.data))
+}

@@ -11,10 +11,12 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
-	"github.com/gotd/td/telegram/calls"
+	calls "github.com/paramon-tech/tuigram/internal/tgcalls"
 	"github.com/gotd/td/tg"
 	"github.com/paramon-tech/tuigram/internal/core"
 	"github.com/paramon-tech/tuigram/internal/platform"
+	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -62,18 +64,20 @@ type callDriver struct {
 }
 
 type nativeCall struct {
-	manager   *nativeCalls
-	ctx       context.Context
-	cancel    context.CancelFunc
-	done      chan struct{}
-	begin     chan struct{}
-	user      tg.InputUserClass
-	incoming  *tg.PhoneCallRequested
-	driver    callDriver
-	remoteEnd atomic.Bool
-	muted     atomic.Bool
-	stopMu    sync.Mutex
-	stopError error
+	manager         *nativeCalls
+	ctx             context.Context
+	cancel          context.CancelFunc
+	done            chan struct{}
+	begin           chan struct{}
+	user            tg.InputUserClass
+	incoming        *tg.PhoneCallRequested
+	driver          callDriver
+	remoteEnd       atomic.Bool
+	muted           atomic.Bool
+	sentPackets     atomic.Uint64
+	receivedPackets atomic.Uint64
+	stopMu          sync.Mutex
+	stopError       error
 
 	inputMu sync.Mutex
 	input   tg.InputPhoneCall
@@ -112,7 +116,29 @@ func (c *client) CallState() core.CallState {
 	}
 	c.native.mu.Lock()
 	defer c.native.mu.Unlock()
-	return c.native.state
+	state := c.native.state
+	if s := c.native.active; s != nil {
+		state.SentPackets = s.sentPackets.Load()
+		state.ReceivedPackets = s.receivedPackets.Load()
+		s.audioMu.Lock()
+		copyCallOutputState(&state, s.audio)
+		s.audioMu.Unlock()
+	}
+	return state
+}
+
+func copyCallOutputState(state *core.CallState, audio callAudio) {
+	// Audio telemetry is optional so other bridges and existing backends can
+	// continue providing calls without implementing decoder diagnostics.
+	if output, ok := audio.(interface {
+		OutputState() platform.CallOutputState
+	}); ok {
+		snapshot := output.OutputState()
+		state.AudioDecodedFrames = snapshot.DecodedFrames
+		state.AudioLevelDB = snapshot.LevelDB
+		state.AudioLastDecodedAt = snapshot.LastDecodedAt
+		state.AudioOutputError = snapshot.Error
+	}
 }
 
 func (c *client) StartCall(ctx context.Context, chat core.Chat) error {
@@ -486,7 +512,11 @@ func (s *nativeCall) run() {
 		if s.muted.Load() || s.ctx.Err() != nil {
 			return nil
 		}
-		return conn.WriteRTP(data)
+		if err := conn.WriteRTP(data); err != nil {
+			return err
+		}
+		s.sentPackets.Add(1)
+		return nil
 	})
 	if err != nil {
 		if s.ctx.Err() == nil {
@@ -518,31 +548,73 @@ func (s *nativeCall) run() {
 	}
 }
 
-func (s *nativeCall) onTrack(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+func (s *nativeCall) onTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	closeReceiver := func() {
+		if receiver != nil {
+			_ = receiver.Stop()
+		}
+	}
 	if track == nil || track.Kind() != webrtc.RTPCodecTypeAudio {
+		closeReceiver()
 		return
 	}
-	go func() {
-		for {
-			packet, _, err := track.ReadRTP()
-			if err != nil {
-				return // Conn.Close unblocks the reader at call termination.
+	go s.receiveAudioUntilClosed(track, closeReceiver)
+}
+
+type incomingCallAudio interface {
+	ReadRTP() (*rtp.Packet, interceptor.Attributes, error)
+	Codec() webrtc.RTPCodecParameters
+}
+
+func (s *nativeCall) receiveAudioUntilClosed(track incomingCallAudio, closeReceiver func()) {
+	// gotd closes its DTLS transport but does not stop each RTP receiver.
+	// Explicitly close the receiver's buffered RTP/RTCP streams so its readers
+	// unblock even when the remote peer sends nothing during hangup.
+	stop := context.AfterFunc(s.ctx, closeReceiver)
+	defer stop()
+	defer closeReceiver()
+	s.receiveAudio(track)
+}
+
+func (s *nativeCall) receiveAudio(track incomingCallAudio) {
+	for {
+		packet, _, err := track.ReadRTP()
+		if err != nil {
+			// Closing a call unblocks its RTP reader; only unexpected read
+			// failures should replace a normal hangup with an error.
+			if s.ctx.Err() == nil {
+				s.stopWithError(fmt.Errorf("receive call audio: %w", err))
 			}
-			if !strings.EqualFold(track.Codec().MimeType, webrtc.MimeTypeOpus) {
-				continue
-			}
-			data, err := packet.Marshal()
-			if err != nil {
-				continue
-			}
-			s.audioMu.Lock()
-			audio := s.audio
-			s.audioMu.Unlock()
-			if audio != nil {
-				_ = audio.WriteRTP(data)
+			return
+		}
+		if s.ctx.Err() != nil {
+			return
+		}
+		codec := track.Codec().MimeType
+		if !strings.EqualFold(codec, webrtc.MimeTypeOpus) {
+			s.stopWithError(fmt.Errorf("receive call audio: unsupported codec %q", codec))
+			return
+		}
+		data, err := packet.Marshal()
+		if err != nil {
+			s.stopWithError(fmt.Errorf("receive call audio packet: %w", err))
+			return
+		}
+		s.audioMu.Lock()
+		if s.audio != nil {
+			err = s.audio.WriteRTP(data)
+			if err == nil {
+				s.receivedPackets.Add(1)
 			}
 		}
-	}()
+		s.audioMu.Unlock()
+		if err != nil {
+			if s.ctx.Err() == nil {
+				s.stopWithError(fmt.Errorf("queue incoming call audio: %w", err))
+			}
+			return
+		}
+	}
 }
 
 func (s *nativeCall) finish(conn callConnection, failure error) {
@@ -587,6 +659,9 @@ func (s *nativeCall) finish(conn callConnection, failure error) {
 	m := s.manager
 	m.mu.Lock()
 	if m.active == s {
+		m.state.SentPackets = s.sentPackets.Load()
+		m.state.ReceivedPackets = s.receivedPackets.Load()
+		copyCallOutputState(&m.state, audio)
 		m.active = nil
 		m.state.Status = "ended"
 		if failure != nil {

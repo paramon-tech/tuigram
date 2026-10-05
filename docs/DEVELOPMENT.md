@@ -8,6 +8,7 @@ Tuigram is a native Go program with a transport-independent application boundary
 cmd/tuigram       CLI, config, authentication lifecycle, terminal startup
 internal/core     Small domain structs and context-aware Client interface
 internal/telegram Native Telegram API adapter, peer lookup, auth, media bounds
+internal/tgcalls  Scoped gotd call transport with channel-negotiation fixes
 internal/demo     Thread-safe in-memory backend for demos and functional tests
 internal/tui      Bubble Tea state machine, rendering, keyboard actions
 internal/config   Defaults, JSON validation, environment overrides
@@ -27,7 +28,7 @@ Attachment downloads stream into private partial files and publish only complete
 
 The settings panel uses `config.Preferences`, which contains no API credentials. Saves reload the existing private config without environment overrides, update only preferences, and use atomic private-file replacement. Shortcut validation preserves fixed navigation, call and quit controls. Poll timers use generations so saving a new interval cannot leave duplicate polling loops. Demo preferences remain in memory.
 
-`core.CallClient` exposes one native two-way voice call at a time. Incoming calls and signaling arrive through Telegram updates; a synchronized backend owns call identity, lifecycle, and cleanup. The UI reads its state every 300 ms without polling Telegram for calls. The pinned gotd [WebRTC call transport](https://gotd.dev/docs/advanced/calls/) handles negotiation and network media. Its custom Telegram reflector relay support is incomplete, so some network/peer combinations cannot connect. Live call interoperability remains unverified.
+`core.CallClient` exposes one native two-way voice call at a time. Incoming calls and signaling arrive through Telegram updates; a synchronized backend owns call identity, lifecycle, and cleanup. The UI reads its state every 300 ms without polling Telegram for calls. `internal/tgcalls` contains a scoped copy of gotd v0.162.0's one-to-one WebRTC call transport, with fixes that distinguish local stream acknowledgments from independent remote stream offers. See its [provenance](../internal/tgcalls/UPSTREAM) and [license](../internal/tgcalls/LICENSE). Custom Telegram reflector relays are unsupported, so some network/peer combinations cannot connect. Live call interoperability after the fix still needs confirmation.
 
 Microphone capture starts after explicit start/answer and transport connection. FFmpeg captures the selected audio device and encodes Opus/RTP to an ephemeral localhost UDP socket. The backend writes packets to the call's audio track; incoming Opus packets are repackaged into Ogg and piped to ffplay. No call recordings are written to disk. Mute gates transmitted packets while keeping capture open. Bounded queues prevent a slow player from blocking network delivery; hangup and shutdown stop and reap both processes. Audio factories and call drivers can be substituted in tests. Speaker selection follows the OS output device; echo cancellation is not implemented.
 
@@ -83,7 +84,7 @@ Upload tests cover real photo/video fixtures, bounded MP4 parsing, sparse large-
 Call tests exercise incoming/outgoing state transitions, explicit microphone startup, mute/hangup, stale events, cancellation, and cleanup using substituted call/audio drivers. Audio tests cover RTP bounds and Ogg framing. An opt-in local integration test uses installed FFmpeg/ffplay with a generated tone and a dummy output driver; it opens neither a real microphone nor speakers and does not connect to Telegram:
 
 ```sh
-TUIGRAM_TEST_CALL_AUDIO=1 go test -race ./internal/platform -run TestCallAudioSyntheticLoopback -count=1
+TUIGRAM_TEST_CALL_AUDIO=1 go test -race ./internal/platform -run 'TestCall(Audio|Output)' -count=1
 ```
 
 CI never needs a phone number, login code, API hash, or session secret. Add regression tests for behavioral bugs and trust boundaries; avoid tests that just repeat implementation details. Run the race detector when changing asynchronous code. Sanitization fuzzing can be run with:
@@ -100,6 +101,6 @@ Qualify native calls with a consenting second test account on another device: ch
 
 The GitHub Actions workflows run tests, smoke checks, vulnerability scanning, and cross-compilation for Linux, FreeBSD, OpenBSD, and Darwin on amd64/arm64. Native Linux/macOS jobs exercise executables; BSD artifacts require additional native qualification.
 
-Release tags follow `vMAJOR.MINOR.PATCH`. The release workflow builds compressed binaries, includes the license and documentation, generates SHA-256 checksums, and creates a **draft** release. Review it and complete live-account/native-OS checks before publishing. Build locally with `bash scripts/package.sh GOOS GOARCH VERSION`, for example `bash scripts/package.sh linux amd64 dev`. `make package` packages the host platform by default.
+Release tags follow `vMAJOR.MINOR.PATCH`. Update [CHANGELOG.md](../CHANGELOG.md) while preparing a release; replace its Unreleased marker with the release date when publishing. The release workflow builds compressed binaries, includes the changelog, licenses and documentation, generates SHA-256 checksums, and creates a **draft** release. Review it and complete live-account/native-OS checks before publishing. Build locally with `bash scripts/package.sh GOOS GOARCH VERSION`, for example `bash scripts/package.sh linux amd64 dev`. `make package` packages the host platform by default.
 
 `Formula/tuigram.rb` provides a HEAD build through a custom Homebrew tap. This repository itself can be tapped with its explicit GitHub URL once the formula is published. Release artifacts and any generated versioned formula must use their actual checksums. Do not substitute a guessed checksum or claim a tap/release is published before it exists.

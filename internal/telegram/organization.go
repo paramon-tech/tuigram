@@ -93,7 +93,7 @@ func (c *client) folder(filter tg.DialogFilterClass) (core.ChatFolder, bool) {
 	return core.ChatFolder{}, false
 }
 func (c *client) Folders(ctx context.Context) ([]core.ChatFolder, error) {
-	response, err := c.api.MessagesGetDialogFilters(ctx)
+	response, err := c.loadDialogFilters(ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +114,7 @@ func (c *client) CreateFolder(ctx context.Context, title string, chat core.Chat)
 	if err != nil {
 		return core.ChatFolder{}, err
 	}
-	response, err := c.api.MessagesGetDialogFilters(ctx)
+	response, err := c.loadDialogFilters(ctx, false)
 	if err != nil {
 		return core.ChatFolder{}, err
 	}
@@ -131,6 +131,7 @@ func (c *client) CreateFolder(ctx context.Context, title string, chat core.Chat)
 	filter := &tg.DialogFilter{ID: id, Title: tg.TextWithEntities{Text: title}, IncludePeers: []tg.InputPeerClass{peer.input}}
 	request := &tg.MessagesUpdateDialogFilterRequest{ID: id}
 	request.SetFilter(filter)
+	defer c.invalidateDialogFilters()
 	ok, err := c.api.MessagesUpdateDialogFilter(ctx, request)
 	if err = organizationResult(ok, err); err != nil {
 		return core.ChatFolder{}, err
@@ -143,7 +144,7 @@ func (c *client) SetFolderChat(ctx context.Context, id int, chat core.Chat, incl
 	if err != nil {
 		return err
 	}
-	response, err := c.api.MessagesGetDialogFilters(ctx)
+	response, err := c.loadDialogFilters(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -186,6 +187,7 @@ func (c *client) SetFolderChat(ctx context.Context, id int, chat core.Chat, incl
 		}
 		request := &tg.MessagesUpdateDialogFilterRequest{ID: id}
 		request.SetFilter(&clone)
+		defer c.invalidateDialogFilters()
 		accepted, err := c.api.MessagesUpdateDialogFilter(ctx, request)
 		return organizationResult(accepted, err)
 	}
@@ -290,7 +292,7 @@ func (c *client) organizedDialogs(ctx context.Context) ([]core.Chat, error) {
 	}
 	// Explicit folder members may fall outside the recent-dialog window. Fetch their
 	// current dialog metadata rather than displaying an empty or incomplete folder.
-	filters, err := c.api.MessagesGetDialogFilters(ctx)
+	filters, err := c.loadDialogFilters(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("load chat folders: %w", err)
 	}

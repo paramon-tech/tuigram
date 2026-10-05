@@ -246,6 +246,7 @@ func (m *Model) managementCommand(kind string, call func(context.Context) manage
 	m.dialogsRequest++
 	m.dialogsPending = false
 	m.historyRequest++
+	m.cancelHistory()
 	m.contactsRequest++
 	m.failure = ""
 	m.status = "Updating Telegram…"

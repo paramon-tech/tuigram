@@ -68,6 +68,8 @@ brew install ffmpeg
 
 `audio check` checks the installed tools, encoder, and capture backend without opening a microphone or speaker. It does not verify microphone permissions, device availability, or a Telegram connection.
 
+Run `./bin/tuigram audio speaker-test` to play a quiet two-second tone through the system output, without opening the microphone or signing in to Telegram. If the tone is silent, check the selected output device and volume in your operating system.
+
 ## Connect to Telegram
 
 Create your own application credentials at [my.telegram.org](https://my.telegram.org), as described in [Telegram's API guide](https://core.telegram.org/api/obtaining_api_id). Tuigram uses the user-account API, not the Bot API.
@@ -135,6 +137,8 @@ For attachments, enter a local path, including `~/...` or a path containing spac
 
 Search with `/`, then press `Enter`. Search runs against the full chat history available to your account, including messages older than the loaded page. Use `[` / `]` to load older/newer pages, `B` or `gg` / `Home` in the messages pane to jump to the earliest message or match, and `L` or `G` / `End` to return to the latest. Scrolling past a loaded edge fetches another page. Selection stays in place while pages load. Normal refresh preserves older loaded pages and does not jump you out of a historical window. Deleted messages and history unavailable to your account cannot be recovered.
 
+Searches are not repeated by background polling. Use `R` while viewing the latest results to refresh them, or submit a new search. Moving to another chat or search cancels an obsolete history request; repeated navigation keys share the same pending request.
+
 Viewed, unfiltered history is acknowledged on Telegram up to the selected message; opening the latest page marks the loaded conversation read. Newer messages that arrive afterward keep their unread count. Search results, hidden narrow-screen history, and overlays do not acknowledge unseen messages. Set **Mark viewed messages read** to false in settings to disable automatic acknowledgements.
 
 Press `o` to organize the selected chat. Pinning, archiving, muting, and folder membership are saved to Telegram. Select Inbox, Archive, All chats, or a Telegram folder and press `Enter` to show it. `n` creates a folder containing the selected chat; highlight a custom folder and use `+` or `-` to change membership. Existing folder rules are preserved. Shared folders are view-only. Automatic folder rules apply to the loaded conversation window; explicitly included folder members are fetched even when outside that window. `u` filters to unread conversations; the chat you just read remains selected until you navigate away, avoiding automatic reads of successive chats.
@@ -142,6 +146,8 @@ Press `o` to organize the selected chat. Pinning, archiving, muting, and folder 
 Open a private conversation and press `C`, then `Enter` to call. Incoming calls show a caller banner; press `Ctrl+g` to open the controls, then `Enter` or `a` to answer, or `x` to decline. During a call, `m` toggles outgoing audio, `x` hangs up, and `Esc` returns to chatting while the call continues. `Ctrl+g` reopens the controls and `Ctrl+x` ends the call anywhere. One call can run at a time; groups, channels, bots, and Saved Messages cannot be called. Demo mode simulates call controls without opening audio devices or connecting to Telegram.
 
 The microphone opens only after you explicitly start or answer a call and its connection is established. Allow microphone access when the operating system prompts. Muting stops transmitted audio while keeping the microphone open; hanging up or quitting closes the audio processes. Speaker output follows the system's selected output device. Use headphones: echo cancellation is not implemented. Native calls remain experimental and need live testing; networks that require Telegram's custom relay protocol may fail to connect.
+
+Call controls show outgoing and incoming audio packet counts. An increasing incoming count means audio is reaching the playback queue; it does not confirm audible speaker output. **Decoded audio** shows whether the player is waiting, decoding silence, or decoding a signal, with its volume in dBFS. These measurements stay in memory and do not record the conversation. Decoder errors are shown even when the player keeps running. If the other person can hear you but you hear nothing, check these lines while they speak, then run `audio speaker-test` in a second terminal during the call to check local output.
 
 ## Configuration and cache
 
@@ -159,12 +165,14 @@ The microphone opens only after you explicitly start or answer a call and its co
 
 Flags precede commands. `config init` prints the path and creates a private JSON config without copying credentials from the environment. Press `,` in the app to change preferences and `Ctrl+s` to save them, or edit the JSON file. The settings panel preserves credentials and unrelated configuration; environment-only credentials are never copied to disk. Theme, download directory, read policy, and shortcut changes apply immediately. Refresh timing changes immediately; microphone changes require restarting. Demo settings apply only for the current session. Partial JSON objects inherit defaults; unknown fields are rejected.
 
+The default refresh interval is 15 seconds; an interval already saved in your config is preserved. Folder rules are cached for one minute during background chat refreshes; opening organization or editing a folder fetches fresh rules. Telegram `FLOOD_WAIT` responses display the remaining wait and stop further requests to the affected API method until that wait expires. Background refreshes also pause, and failed read receipts back off. User actions such as sending a message are not automatically repeated; retry after the displayed wait. These cooldowns last for the current app session, so restarting does not remove a limit imposed by Telegram.
+
 ```json
 {
   "theme": "midnight",
   "cache_max_bytes": 33554432,
   "cache_ttl_hours": 24,
-  "poll_seconds": 5,
+  "poll_seconds": 15,
   "download_dir": "",
   "mark_read": true,
   "key_bindings": {},
@@ -181,7 +189,7 @@ Flags precede commands. `config init` prints the path and creates a private JSON
 | `cache_ttl_hours` | 24 hours; expired entries are removed during cache access/startup |
 | `cache_dir` | OS cache directory + `tuigram`; `XDG_CACHE_HOME` overrides base |
 | `state_dir` | `~/.local/state/tuigram`; `XDG_STATE_HOME` overrides base |
-| `poll_seconds` | 5 seconds; minimum 2 |
+| `poll_seconds` | 15 seconds; minimum 2 |
 | `download_dir` | Empty uses `~/Downloads/tuigram`; otherwise an absolute private directory |
 | `mark_read` | `true`; acknowledge viewed messages on Telegram and refresh unread counts |
 | `key_bindings` | Optional action-to-key map: `compose`, `attach`, `react`, `organization`, `settings`, `search`, `theme`, `refresh`. For example `{"settings":";"}`; fixed navigation/call/quit shortcuts stay reserved |
@@ -217,4 +225,6 @@ make vet
 make vuln       # reachable dependency vulnerability scan
 ```
 
-See [development and contribution conventions](docs/DEVELOPMENT.md), [security and local data](SECURITY.md), and the [MIT license](LICENSE). CI runs unit/functional tests, race checks, smoke tests, and cross-platform binary builds. None of these tests sends messages through your Telegram account.
+See the [changelog](CHANGELOG.md), [development and contribution conventions](docs/DEVELOPMENT.md), [security and local data](SECURITY.md), and the [MIT license](LICENSE). CI runs unit/functional tests, race checks, smoke tests, and cross-platform binary builds. None of these tests sends messages through your Telegram account.
+
+The one-to-one call transport includes a scoped copy of gotd's call package with Telegram channel-negotiation fixes. Its [upstream provenance](internal/tgcalls/UPSTREAM) and [MIT license](internal/tgcalls/LICENSE) are retained; release archives include that license.

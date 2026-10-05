@@ -92,6 +92,7 @@ func TestDemoFunctionalConversationJourney(t *testing.T) {
 		t.Fatal("message search did not filter rendered history")
 	}
 	model = key(t, model, "r")
+	model = key(t, model, "enter")
 	saved = history(t, client, "saved")
 	if reactions := saved[len(saved)-1].Reactions; len(reactions) != 1 || reactions[0].Emoji != "👍" || reactions[0].Count != 1 {
 		t.Fatalf("selected search result did not receive reaction: %v", reactions)
@@ -165,5 +166,89 @@ func TestDemoFunctionalPhotoPreview(t *testing.T) {
 	model = key(t, model, "esc")
 	if strings.Contains(model.View(), "Image preview") {
 		t.Fatal("image preview did not close")
+	}
+}
+
+func TestDemoFunctionalManagementJourney(t *testing.T) {
+	client := demo.New()
+	var model tea.Model = tui.New(context.Background(), client, tui.Options{PollInterval: -1})
+	model = drain(t, model, model.Init())
+	model = dispatch(t, model, tea.WindowSizeMsg{Width: 110, Height: 30})
+	// Browse saved contacts, select a member and create a real demo group.
+	model = key(t, model, "N")
+	model = dispatch(t, model, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	model = key(t, model, "enter")
+	model = paste(t, model, "Release Team")
+	model = key(t, model, "enter")
+	chats, err := client.Dialogs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := chats[len(chats)-1]
+	if group.Title != "Release Team" || group.Kind != "group" {
+		t.Fatalf("group not created: %#v", chats)
+	}
+	model = key(t, model, "e")
+	model = dispatch(t, model, tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = paste(t, model, "New Team Name")
+	model = key(t, model, "enter")
+	chats, _ = client.Dialogs(context.Background())
+	if chats[len(chats)-1].Title != "New Team Name" {
+		t.Fatal("group not renamed")
+	}
+	// A destructive action requires y; Enter cannot accidentally confirm it.
+	model = key(t, model, "D")
+	model = key(t, model, "enter")
+	chats, _ = client.Dialogs(context.Background())
+	if len(chats) != 4 {
+		t.Fatal("Enter deleted group")
+	}
+	model = key(t, model, "esc")
+	model = key(t, model, "D")
+	model = key(t, model, "y")
+	chats, _ = client.Dialogs(context.Background())
+	if len(chats) != 3 {
+		t.Fatal("group was not left")
+	}
+	model = key(t, model, "R")
+	if strings.Contains(model.View(), "New Team Name") {
+		t.Fatal("refresh resurrected deleted chat")
+	}
+
+	// Add by phone, edit a name including a physical space, open and message.
+	model = key(t, model, "c")
+	model = key(t, model, "enter")
+	model = key(t, model, "n")
+	model = paste(t, model, "+14155552671")
+	model = key(t, model, "enter")
+	model = paste(t, model, "Demo Friend")
+	model = key(t, model, "enter")
+	model = key(t, model, "e")
+	model = dispatch(t, model, tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = paste(t, model, "Renamed")
+	model = dispatch(t, model, tea.KeyMsg{Type: tea.KeySpace})
+	model = paste(t, model, "Friend")
+	model = key(t, model, "enter")
+	contacts, err := client.SearchContacts(context.Background(), "Renamed Friend")
+	if err != nil || len(contacts) != 1 {
+		t.Fatalf("contact not renamed: %v %v", contacts, err)
+	}
+	contact := contacts[0]
+	model = key(t, model, "enter")
+	model = key(t, model, "i")
+	model = paste(t, model, "Keep this history")
+	model = key(t, model, "ctrl+s")
+	model = key(t, model, "c")
+	model = paste(t, model, "Renamed Friend")
+	model = key(t, model, "enter")
+	model = key(t, model, "D")
+	model = key(t, model, "y")
+	contacts, _ = client.SearchContacts(context.Background(), "Renamed Friend")
+	if len(contacts) != 0 {
+		t.Fatal("contact not deleted")
+	}
+	messages := history(t, client, contact.ID)
+	if len(messages) != 1 || messages[0].Text != "Keep this history" {
+		t.Fatal("contact deletion removed messages")
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,14 +28,21 @@ type peerRecord struct {
 	username  string
 	firstName string
 	lastName  string
+	phone     string
+	bot       bool
+	contact   bool
+	protected bool
 }
 
 type client struct {
-	telegram  *gotd.Client
-	api       *tg.Client
-	mu        sync.RWMutex
-	peers     map[string]peerRecord
-	accountID int64 // Authenticated before this client is exposed to the TUI.
+	telegram         *gotd.Client
+	api              *tg.Client
+	mu               sync.RWMutex
+	peers            map[string]peerRecord
+	accountID        int64 // Authenticated before this client is exposed to the TUI.
+	native           *nativeCalls
+	notifyDefaults   map[string]bool
+	notifyDefaultsAt time.Time
 }
 
 var _ core.Client = (*client)(nil)
@@ -73,8 +79,10 @@ func (c *client) remember(users []tg.UserClass, chats []tg.ChatClass) {
 		}
 		// A minimal entity may omit its access hash. Keep a full entity already
 		// learned through dialogs or contact search instead of invalidating it.
+		contact, bot := u.Contact, u.Bot
 		if existing, exists := c.peers[id]; exists && u.Min {
 			input = existing.input
+			contact, bot = contact || existing.contact, bot || existing.bot
 		}
 		title := strings.TrimSpace(u.FirstName + " " + u.LastName)
 		if title == "" {
@@ -83,7 +91,7 @@ func (c *client) remember(users []tg.UserClass, chats []tg.ChatClass) {
 		if title == "" {
 			title = "Deleted account"
 		}
-		c.peers[id] = peerRecord{input: input, title: title, kind: "private", username: u.Username, firstName: u.FirstName, lastName: u.LastName}
+		c.peers[id] = peerRecord{input: input, title: title, kind: "private", username: u.Username, firstName: u.FirstName, lastName: u.LastName, phone: u.Phone, bot: bot, contact: contact}
 	}
 	for _, item := range chats {
 		var id string
@@ -91,19 +99,20 @@ func (c *client) remember(users []tg.UserClass, chats []tg.ChatClass) {
 		switch chat := item.(type) {
 		case *tg.Chat:
 			id = peerID(&tg.PeerChat{ChatID: chat.ID})
-			record = peerRecord{input: &tg.InputPeerChat{ChatID: chat.ID}, title: chat.Title, kind: "group"}
+			record = peerRecord{input: &tg.InputPeerChat{ChatID: chat.ID}, title: chat.Title, kind: "group", protected: chat.Noforwards}
 		case *tg.ChatForbidden:
 			id = peerID(&tg.PeerChat{ChatID: chat.ID})
-			record = peerRecord{input: &tg.InputPeerChat{ChatID: chat.ID}, title: chat.Title, kind: "group"}
+			record = peerRecord{input: &tg.InputPeerChat{ChatID: chat.ID}, title: chat.Title, kind: "group", protected: c.peers[id].protected}
 		case *tg.Channel:
 			id = peerID(&tg.PeerChannel{ChannelID: chat.ID})
 			kind := "channel"
 			if chat.Megagroup {
 				kind = "group"
 			}
-			record = peerRecord{input: &tg.InputPeerChannel{ChannelID: chat.ID, AccessHash: chat.AccessHash}, title: chat.Title, kind: kind}
+			record = peerRecord{input: &tg.InputPeerChannel{ChannelID: chat.ID, AccessHash: chat.AccessHash}, title: chat.Title, kind: kind, protected: chat.Noforwards}
 			if existing, exists := c.peers[id]; exists && chat.Min {
 				record.input = existing.input
+				record.protected = record.protected || existing.protected
 			}
 		case *tg.ChannelForbidden:
 			id = peerID(&tg.PeerChannel{ChannelID: chat.ID})
@@ -111,7 +120,7 @@ func (c *client) remember(users []tg.UserClass, chats []tg.ChatClass) {
 			if chat.Megagroup {
 				kind = "group"
 			}
-			record = peerRecord{input: &tg.InputPeerChannel{ChannelID: chat.ID, AccessHash: chat.AccessHash}, title: chat.Title, kind: kind}
+			record = peerRecord{input: &tg.InputPeerChannel{ChannelID: chat.ID, AccessHash: chat.AccessHash}, title: chat.Title, kind: kind, protected: c.peers[id].protected}
 		default:
 			continue
 		}
@@ -130,70 +139,7 @@ func (c *client) peer(id string) (peerRecord, error) {
 }
 
 func (c *client) Dialogs(ctx context.Context) ([]core.Chat, error) {
-	request := &tg.MessagesGetDialogsRequest{
-		OffsetPeer: &tg.InputPeerEmpty{}, Limit: resultLimit,
-	}
-	chats := make([]core.Chat, 0, resultLimit)
-	seen := make(map[string]bool)
-	for page := 0; page < 10; page++ {
-		response, err := c.api.MessagesGetDialogs(ctx, request)
-		if err != nil {
-			return nil, fmt.Errorf("load dialogs: %w", err)
-		}
-		var dialogs []tg.DialogClass
-		var messages []tg.MessageClass
-		complete := false
-		switch result := response.(type) {
-		case *tg.MessagesDialogs:
-			c.remember(result.Users, result.Chats)
-			dialogs, messages, complete = result.Dialogs, result.Messages, true
-		case *tg.MessagesDialogsSlice:
-			c.remember(result.Users, result.Chats)
-			dialogs, messages = result.Dialogs, result.Messages
-		default:
-			return nil, errors.New("Telegram returned an unexpected dialogs response")
-		}
-		var last *tg.Dialog
-		added := 0
-		for _, item := range dialogs {
-			dialog, ok := item.(*tg.Dialog)
-			if !ok {
-				continue
-			}
-			id := peerID(dialog.Peer)
-			record, err := c.peer(id)
-			if err != nil {
-				continue
-			}
-			last = dialog
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			chats = append(chats, core.Chat{ID: id, Title: record.title, Kind: record.kind, Unread: dialog.UnreadCount})
-			added++
-		}
-		if complete || last == nil || added == 0 || len(dialogs) == 0 {
-			break
-		}
-		record, _ := c.peer(peerID(last.Peer))
-		request.OffsetID, request.OffsetPeer = last.TopMessage, record.input
-		request.OffsetDate = 0
-		for _, item := range messages {
-			switch message := item.(type) {
-			case *tg.Message:
-				if message.ID == last.TopMessage && peerID(message.PeerID) == peerID(last.Peer) {
-					request.OffsetDate = message.Date
-				}
-			case *tg.MessageService:
-				if message.ID == last.TopMessage && peerID(message.PeerID) == peerID(last.Peer) {
-					request.OffsetDate = message.Date
-				}
-			}
-		}
-		request.ExcludePinned = true
-	}
-	return chats, nil
+	return c.organizedDialogs(ctx)
 }
 
 func (c *client) unpack(response tg.MessagesMessagesClass) ([]tg.MessageClass, error) {
@@ -213,31 +159,8 @@ func (c *client) unpack(response tg.MessagesMessagesClass) ([]tg.MessageClass, e
 }
 
 func (c *client) History(ctx context.Context, chat core.Chat, query string) ([]core.Message, error) {
-	record, err := c.peer(chat.ID)
-	if err != nil {
-		return nil, err
-	}
-	var response tg.MessagesMessagesClass
-	if strings.TrimSpace(query) == "" {
-		response, err = c.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: record.input, Limit: resultLimit})
-	} else {
-		response, err = c.api.MessagesSearch(ctx, &tg.MessagesSearchRequest{Peer: record.input, Q: query, Filter: &tg.InputMessagesFilterEmpty{}, Limit: resultLimit})
-	}
-	if err != nil {
-		return nil, fmt.Errorf("load messages: %w", err)
-	}
-	messages, err := c.unpack(response)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]core.Message, 0, len(messages))
-	for _, item := range messages {
-		if message, ok := item.(*tg.Message); ok {
-			result = append(result, c.message(chat, message))
-		}
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
-	return result, nil
+	page, err := c.HistoryPage(ctx, chat, core.HistoryRequest{Query: query})
+	return page.Messages, err
 }
 
 func (c *client) message(chat core.Chat, message *tg.Message) core.Message {
@@ -250,7 +173,8 @@ func (c *client) message(chat core.Chat, message *tg.Message) core.Message {
 		Time: time.Unix(int64(message.Date), 0), Outgoing: message.Out, Forwarded: forwarded}
 	for _, count := range message.Reactions.Results {
 		if emoji, ok := count.Reaction.(*tg.ReactionEmoji); ok {
-			result.Reactions = append(result.Reactions, core.Reaction{Emoji: emoji.Emoticon, Count: count.Count})
+			_, mine := count.GetChosenOrder()
+			result.Reactions = append(result.Reactions, core.Reaction{Emoji: emoji.Emoticon, Count: count.Count, Mine: mine})
 		}
 	}
 	switch media := message.Media.(type) {
@@ -264,6 +188,7 @@ func (c *client) message(chat core.Chat, message *tg.Message) core.Message {
 		result.MediaLabel = "Attachment"
 		if document, ok := media.Document.(*tg.Document); ok {
 			result.Image = strings.HasPrefix(document.MimeType, "image/")
+			result.Voice = media.Voice
 			if result.Image && media.TTLSeconds == 0 {
 				result.MediaKey = c.mediaKey(message, "document", document.ID)
 			}
@@ -272,12 +197,24 @@ func (c *client) message(chat core.Chat, message *tg.Message) core.Message {
 				if name, ok := attr.(*tg.DocumentAttributeFilename); ok {
 					result.MediaLabel = name.FileName
 				}
+				if audio, ok := attr.(*tg.DocumentAttributeAudio); ok && audio.Voice {
+					result.Voice = true
+				}
+			}
+			if result.Voice {
+				result.MediaLabel = "Voice message"
 			}
 		}
 	case *tg.MessageMediaWebPage:
 		if page, ok := media.Webpage.(*tg.WebPage); ok && !strings.Contains(result.Text, page.URL) {
 			result.Text += "\n" + page.URL
 		}
+	}
+	_, _, mediaErr := mediaLocation(message)
+	result.Downloadable = mediaErr == nil
+	if record, err := c.peer(chat.ID); err == nil && record.protected {
+		result.Downloadable = false
+		result.MediaKey = ""
 	}
 	// Telegram text-url entities may hide a link behind a label. Preserve the
 	// destination as plain text so terminal users can inspect it before opening.
@@ -366,7 +303,7 @@ func (c *client) React(ctx context.Context, chat core.Chat, messageID int, emoji
 func (c *client) SearchContacts(ctx context.Context, query string) ([]core.Contact, error) {
 	query = strings.TrimPrefix(strings.TrimSpace(query), "@")
 	if query == "" {
-		return nil, errors.New("enter a contact name or Telegram username")
+		return c.savedContacts(ctx)
 	}
 	response, err := c.api.ContactsSearch(ctx, &tg.ContactsSearchRequest{Q: query, Limit: resultLimit})
 	if err != nil {

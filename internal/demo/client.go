@@ -21,6 +21,8 @@ type Client struct {
 	chats    []core.Chat
 	messages map[string][]core.Message
 	contacts []core.Contact
+	folders  []core.ChatFolder
+	uploads  map[int]uploadedMedia
 	nextID   int
 }
 
@@ -31,11 +33,11 @@ func New() *Client {
 	return &Client{
 		chats: []core.Chat{{ID: "saved", Title: "Saved Messages", Kind: "private"}, {ID: "builders", Title: "Tuigram builders", Kind: "group", Unread: 2}, {ID: "news", Title: "Telegram updates", Kind: "channel"}},
 		messages: map[string][]core.Message{
-			"saved":    {{ID: 1, ChatID: "saved", Sender: "You", Text: "Welcome to tuigram 👋\nYour conversations, at keyboard speed.", Time: t, Outgoing: true}, {ID: 2, ChatID: "saved", Sender: "You", Text: "Press ? for help. Try i to compose, / to search, and Tab to switch panes.\nhttps://github.com/paramon-tech/tuigram", Time: t.Add(time.Minute), Outgoing: true, Reactions: []core.Reaction{{Emoji: "👍", Count: 3}}}, {ID: 3, ChatID: "saved", Sender: "You", Text: "A little terminal sunset. Select this message and press v to preview.", Time: t.Add(2 * time.Minute), Image: true, MediaLabel: "photo"}},
-			"builders": {{ID: 4, ChatID: "builders", Sender: "Ada", Text: "Ship small. Test thoroughly. 🚀", Time: t, Reactions: []core.Reaction{{Emoji: "❤", Count: 2}}}, {ID: 5, ChatID: "builders", Sender: "Linus", Text: "Vim keys, a quiet terminal, and good company.", Time: t.Add(time.Minute)}},
+			"saved":    {{ID: 1, ChatID: "saved", Sender: "You", Text: "Welcome to tuigram 👋\nYour conversations, at keyboard speed.", Time: t, Outgoing: true}, {ID: 2, ChatID: "saved", Sender: "You", Text: "Press ? for help. Try i to compose, / to search, and Tab to switch panes.\nhttps://github.com/paramon-tech/tuigram", Time: t.Add(time.Minute), Outgoing: true, Reactions: []core.Reaction{{Emoji: "👍", Count: 3}}}, {ID: 3, ChatID: "saved", Sender: "You", Text: "A little terminal sunset. Select this message and press v to preview.", Time: t.Add(2 * time.Minute), Image: true, Downloadable: true, MediaLabel: "photo"}},
+			"builders": {{ID: 4, ChatID: "builders", Sender: "Ada", Text: "Ship small. Test thoroughly. 🚀", Time: t, Reactions: []core.Reaction{{Emoji: "❤", Count: 2}}}, {ID: 5, ChatID: "builders", Sender: "Linus", Text: "Vim keys, a quiet terminal, and good company.", Time: t.Add(time.Minute)}, {ID: 7, ChatID: "builders", Sender: "Ada", Text: "An audio playback sample: a short tone.", Time: t.Add(2 * time.Minute), Voice: true, Downloadable: true, MediaLabel: "Demo voice message (tone)"}},
 			"news":     {{ID: 6, ChatID: "news", Sender: "Telegram updates", Text: "Demo channel: posts, forwarding, and reactions all work locally.", Time: t}},
 		},
-		contacts: []core.Contact{{ID: "ada", Name: "Ada Lovelace", Username: "ada"}, {ID: "linus", Name: "Linus", Username: "linus"}}, nextID: 7,
+		contacts: []core.Contact{{ID: "ada", Name: "Ada Lovelace", Username: "ada"}, {ID: "linus", Name: "Linus", Username: "linus"}}, nextID: 8,
 	}
 }
 
@@ -106,6 +108,9 @@ func (c *Client) Forward(ctx context.Context, from core.Chat, id int, to core.Ch
 	}
 	for _, m := range c.messages[from.ID] {
 		if m.ID == id {
+			if upload, ok := c.uploads[id]; ok {
+				c.uploads[c.nextID] = upload
+			}
 			m.ID = c.nextID
 			c.nextID++
 			m.ChatID = to.ID
@@ -121,24 +126,7 @@ func (c *Client) Forward(ctx context.Context, from core.Chat, id int, to core.Ch
 }
 
 func (c *Client) React(ctx context.Context, chat core.Chat, id int, emoji string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for i, m := range c.messages[chat.ID] {
-		if m.ID == id {
-			for j, r := range m.Reactions {
-				if r.Emoji == emoji {
-					c.messages[chat.ID][i].Reactions[j].Count++
-					return nil
-				}
-			}
-			c.messages[chat.ID][i].Reactions = append(m.Reactions, core.Reaction{Emoji: emoji, Count: 1})
-			return nil
-		}
-	}
-	return errors.New("message not found")
+	return c.react(ctx, chat, id, emoji)
 }
 
 func (c *Client) SearchContacts(ctx context.Context, query string) ([]core.Contact, error) {
@@ -188,6 +176,9 @@ func (c *Client) DownloadImage(ctx context.Context, chat core.Chat, id int) ([]b
 	}
 	if !found {
 		return nil, errors.New("message has no photo")
+	}
+	if upload, ok := c.uploads[id]; ok {
+		return append([]byte(nil), upload.data...), nil
 	}
 	img := image.NewRGBA(image.Rect(0, 0, 120, 60))
 	for y := 0; y < 60; y++ {

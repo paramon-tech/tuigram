@@ -179,3 +179,32 @@ func TestRejectsSharedDataDirectory(t *testing.T) {
 		t.Fatal("same directory accepted for cache and sessions")
 	}
 }
+
+func TestCallAudioConfiguration(t *testing.T) {
+	environment(t)
+	c, err := Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.CallInputFormat = "avfoundation"
+	c.CallInputDevice = "External USB Microphone"
+	p := filepath.Join(privateTempDir(t), "config.json")
+	if err := Save(p, c); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(p)
+	if err != nil || got.CallInputDevice != c.CallInputDevice || got.CallInputFormat != c.CallInputFormat {
+		t.Fatalf("audio config round trip: %#v %v", got, err)
+	}
+	for _, format := range []string{"lavfi", "file", "concat", "; sh"} {
+		c.CallInputFormat = format
+		if err := c.Validate(); err == nil {
+			t.Fatalf("unsafe backend accepted: %q", format)
+		}
+	}
+	c.CallInputFormat = ""
+	c.CallInputDevice = "microphone\x00other"
+	if err := c.Validate(); err == nil {
+		t.Fatal("invalid device accepted")
+	}
+}

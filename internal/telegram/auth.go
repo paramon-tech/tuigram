@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/gotd/td/session"
 	gotd "github.com/gotd/td/telegram"
@@ -20,6 +22,7 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/mdp/qrterminal/v3"
 	"github.com/paramon-tech/tuigram/internal/core"
+	"github.com/paramon-tech/tuigram/internal/platform"
 	"golang.org/x/term"
 )
 
@@ -32,6 +35,7 @@ type Options struct {
 	QR             bool
 	Input          io.Reader
 	Output         io.Writer
+	CallAudio      platform.CallAudioOptions
 }
 
 // Run connects, authenticates an existing Telegram account, and keeps the
@@ -56,6 +60,22 @@ func Run(ctx context.Context, opts Options, fn func(context.Context, core.Client
 	prompt := newPrompter(opts.Input, opts.Output)
 	dispatcher := tg.NewUpdateDispatcher()
 	loggedIn := qrlogin.OnLoginToken(&dispatcher)
+	// Install every handler before giving the dispatcher to gotd. Publishing
+	// the authenticated backend through an atomic pointer also avoids races
+	// with updates arriving while authentication is still in progress.
+	var voice atomic.Pointer[nativeCalls]
+	dispatcher.OnPhoneCall(func(ctx context.Context, entities tg.Entities, update *tg.UpdatePhoneCall) error {
+		if handler := voice.Load(); handler != nil {
+			return handler.handle(ctx, entities, update)
+		}
+		return nil
+	})
+	dispatcher.OnPhoneCallSignalingData(func(ctx context.Context, _ tg.Entities, update *tg.UpdatePhoneCallSignalingData) error {
+		if handler := voice.Load(); handler != nil {
+			return handler.signal(ctx, update)
+		}
+		return nil
+	})
 	client := gotd.NewClient(opts.AppID, opts.AppHash, gotd.Options{
 		SessionStorage: opts.SessionStorage,
 		UpdateHandler:  dispatcher,
@@ -98,6 +118,16 @@ func Run(ctx context.Context, opts Options, fn func(context.Context, core.Client
 		}
 		backend := newClient(client)
 		backend.accountID = self.ID
+		backend.native = newNativeCalls(ctx, backend, opts.CallAudio)
+		voice.Store(backend.native)
+		defer func() {
+			voice.Store(nil)
+			// A dispatched phone.requestCall has up to 15 seconds to return
+			// its identity, followed by up to 5 seconds for the final discard.
+			shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 21*time.Second)
+			defer cancel()
+			_ = backend.EndCall(shutdown, 0)
+		}()
 		return fn(ctx, backend)
 	})
 }

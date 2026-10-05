@@ -19,6 +19,7 @@ import (
 	"github.com/paramon-tech/tuigram/internal/config"
 	"github.com/paramon-tech/tuigram/internal/core"
 	"github.com/paramon-tech/tuigram/internal/demo"
+	"github.com/paramon-tech/tuigram/internal/platform"
 	"github.com/paramon-tech/tuigram/internal/storage"
 	"github.com/paramon-tech/tuigram/internal/telegram"
 	"github.com/paramon-tech/tuigram/internal/tui"
@@ -49,9 +50,11 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 	snapshot := flags.Bool("snapshot", false, "render the demo once without a terminal (requires --demo)")
 	qr := flags.Bool("qr", false, "sign in by scanning a QR code")
 	theme := flags.String("theme", "", "theme: midnight, light, or dracula")
+	callInputFormat := flags.String("call-input-format", "", "microphone backend: avfoundation, pulse, alsa, oss, sndio")
+	callInputDevice := flags.String("call-input-device", "", "microphone name/index (default: system default)")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	flags.Usage = func() {
-		fmt.Fprintln(errOut, "Usage: tuigram [flags] [config init | cache stats | cache clear]\n\nA keyboard-driven Telegram client. Start with --demo; press ? for keys.\nFlags must precede commands.")
+		fmt.Fprintln(errOut, "Usage: tuigram [flags] [config init | cache stats | cache clear | audio devices | audio check]\n\nA keyboard-driven Telegram client. Start with --demo; press ? for keys.\nFlags must precede commands.")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -68,7 +71,7 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 		return errors.New("--snapshot requires --demo")
 	}
 	command := strings.Join(flags.Args(), " ")
-	if command != "" && command != "config init" && command != "cache stats" && command != "cache clear" {
+	if command != "" && command != "config init" && command != "cache stats" && command != "cache clear" && command != "audio devices" && command != "audio check" {
 		return fmt.Errorf("unknown command %q; use --help", command)
 	}
 	cfg, err := config.Load(*configPath)
@@ -77,9 +80,31 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 	}
 	if *theme != "" {
 		cfg.Theme = *theme
-		if err := cfg.Validate(); err != nil {
+	}
+	if *callInputFormat != "" {
+		cfg.CallInputFormat = *callInputFormat
+	}
+	if *callInputDevice != "" {
+		cfg.CallInputDevice = *callInputDevice
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	callAudio := platform.CallAudioOptions{InputFormat: cfg.CallInputFormat, InputDevice: cfg.CallInputDevice}
+	if command == "audio devices" {
+		devices, err := platform.ListCallAudioDevices(ctx, callAudio)
+		if err != nil {
 			return err
 		}
+		fmt.Fprintln(out, tui.Sanitize(devices))
+		return nil
+	}
+	if command == "audio check" {
+		if err := platform.CheckCallAudio(ctx, callAudio); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "Native call audio tools are ready. Microphone permission is requested when you start or answer a call; speakers use the system default output.")
+		return nil
 	}
 	if command == "config init" {
 		path := *configPath
@@ -122,7 +147,8 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 		fmt.Fprintf(out, "%d files, %d bytes (limit %d bytes, TTL %dh)\n", n, size, cfg.CacheMaxBytes, cfg.CacheTTLHours)
 		return nil
 	}
-	opts := tui.Options{Theme: cfg.Theme, PollInterval: time.Duration(cfg.PollSeconds) * time.Second}
+	opts := tui.Options{Theme: cfg.Theme, PollInterval: time.Duration(cfg.PollSeconds) * time.Second,
+		DownloadDir: cfg.DownloadDir, Preferences: cfg.Preferences(), DisableAutoRead: !cfg.MarkRead}
 	if *demoMode {
 		client := demo.New()
 		if *snapshot {
@@ -135,6 +161,7 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 		}
 		return runTUI(ctx, client, opts, in, out)
 	}
+	opts.SavePreferences = func(p config.Preferences) error { return config.SavePreferences(*configPath, p) }
 	if cfg.AppID == 0 || cfg.AppHash == "" {
 		return errors.New("set TUIGRAM_API_ID and TUIGRAM_API_HASH from my.telegram.org, or try tuigram --demo")
 	}
@@ -162,17 +189,24 @@ func run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer)
 		return err
 	}
 	defer session.Close()
-	return telegram.Run(ctx, telegram.Options{AppID: cfg.AppID, AppHash: cfg.AppHash, SessionStorage: session, QR: *qr, Input: in, Output: errOut}, func(clientCtx context.Context, client core.Client) error {
+	return telegram.Run(ctx, telegram.Options{AppID: cfg.AppID, AppHash: cfg.AppHash, SessionStorage: session, QR: *qr, Input: in, Output: errOut, CallAudio: callAudio}, func(clientCtx context.Context, client core.Client) error {
 		return runTUI(clientCtx, client, opts, in, out)
 	})
 }
 
 func runTUI(ctx context.Context, client core.Client, opts tui.Options, in *os.File, out io.Writer) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if !term.IsTerminal(int(in.Fd())) {
 		return errors.New("TUI requires a terminal; use --demo --snapshot for a headless preview")
 	}
-	p := tea.NewProgram(tui.New(ctx, client, opts), tea.WithContext(ctx), tea.WithAltScreen(), tea.WithInput(in), tea.WithOutput(out))
-	_, err := p.Run()
+	p := tea.NewProgram(tui.New(runCtx, client, opts), tea.WithContext(runCtx), tea.WithAltScreen(), tea.WithInput(in), tea.WithOutput(out))
+	finalModel, err := p.Run()
+	cancel()
+	if model, ok := finalModel.(tui.Model); ok {
+		model.ShutdownCalls()
+		model.ShutdownMedia()
+	}
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return ctx.Err()
 	}

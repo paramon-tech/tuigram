@@ -77,3 +77,15 @@ func TestCLIValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestAudioDiagnosticsDoNotRequireTelegramCredentials(t *testing.T) {
+	cliEnvironment(t)
+	t.Setenv("PATH", t.TempDir())
+	for _, command := range []string{"check", "devices"} {
+		var out bytes.Buffer
+		err := run(context.Background(), []string{"audio", command}, os.Stdin, &out, &out)
+		if err == nil || !strings.Contains(err.Error(), "FFmpeg") || strings.Contains(err.Error(), "TUIGRAM_API_ID") {
+			t.Fatalf("audio %s did not reach offline diagnostics: %v", command, err)
+		}
+	}
+}

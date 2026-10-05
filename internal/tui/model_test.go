@@ -200,6 +200,10 @@ func TestForwardAndReactionUseSelectedMessage(t *testing.T) {
 		t.Fatalf("wrong forwarding route: %v", f.calls)
 	}
 	m, cmd = press(m, "r")
+	if m.mode != reactionPicker || cmd != nil {
+		t.Fatal("reaction picker did not open")
+	}
+	m, cmd = press(m, "enter")
 	m = complete(m, cmd)
 	if f.calls[len(f.calls)-1] != "react:one:2:👍" {
 		t.Fatalf("wrong reaction: %v", f.calls)

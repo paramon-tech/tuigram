@@ -1,0 +1,33 @@
+name: Task
+description: Plan a change with clear acceptance criteria.
+title: "[Task]: "
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: State the problem and the intended result.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: List the affected areas and explicit exclusions.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List observable conditions for completion.
+      placeholder: "- [ ] The expected behavior is verified."
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Verification and documentation
+      description: List tests, documentation updates, and relevant security checks.
+    validations:
+      required: true
